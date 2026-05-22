@@ -824,3 +824,47 @@ mod codec {
         assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::InvalidName));
     }
 }
+
+mod hash_literals {
+    use super::*;
+    use crate::calculus::ast::{BTerm, Obligation};
+    use crate::calculus::encode::to_string;
+    use bitcoin::hashes::{sha256, Hash as _};
+
+    #[test]
+    fn hashlock_parses_evaluates_and_round_trips() {
+        let preimage = b"open sesame".to_vec();
+        let digest = sha256::Hash::hash(&preimage).to_byte_array();
+        let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+        let src = format!("prove(hashlock(sha256:0x{}))", hex);
+
+        // Parses to a hashlock obligation.
+        let d = parse::<Pk>(&src).unwrap();
+        assert!(matches!(d.body, BTerm::Prove(Obligation::Hashlock(_))));
+
+        // Evaluates: revealing the preimage authorizes; absence does not.
+        let op = MockOp::spend(1, "x");
+        let st = MockLedger::default();
+        let dv = HashValue::Sha256(digest);
+        let w = Witness::empty().with_preimage(dv, preimage);
+        assert!(evaluate(&d, &op, &st, &w, &MockVerifier).unwrap());
+        assert!(!evaluate(&d, &op, &st, &Witness::empty(), &MockVerifier).unwrap());
+
+        // Round-trips through the canonical source form.
+        let printed = to_string(&d);
+        assert_eq!(d, parse::<Pk>(&printed).unwrap());
+    }
+
+    #[test]
+    fn bytes_literal_round_trips() {
+        // A `with` constant bound to a raw byte string.
+        let d = parse::<Pk>("with(tag = 0xdeadbeef, in cmp(=, tag, tag))").unwrap();
+        assert_eq!(d.constants.get("tag"), Some(&Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])));
+        assert_eq!(d, parse::<Pk>(&to_string(&d)).unwrap());
+    }
+
+    #[test]
+    fn wrong_digest_length_is_rejected() {
+        assert!(parse::<Pk>("prove(hashlock(sha256:0xdead))").is_err());
+    }
+}

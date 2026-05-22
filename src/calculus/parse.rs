@@ -12,6 +12,7 @@
 //! combinators, the [`ValueFn`](super::registry::ValueFn) table, the
 //! [`StatePred`](super::registry::StatePred) table, and the obligation forms, in that order.
 
+use core::convert::TryInto;
 use core::fmt;
 use core::str::FromStr;
 
@@ -21,7 +22,56 @@ use crate::MiniscriptKey;
 use super::ast::{BTerm, Descriptor, Obligation, VTerm};
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
 use super::schema::Schema;
-use super::value::Value;
+use super::value::{HashValue, Value};
+
+fn is_hashfn(w: &str) -> bool {
+    matches!(w, "sha256" | "hash256" | "ripemd160" | "hash160")
+}
+
+/// Decode a hex string (without `0x`) into bytes, rejecting odd lengths and non-hex digits.
+fn decode_hex(s: &str) -> Result<Vec<u8>, ParseError> {
+    if s.len() % 2 != 0 {
+        return err("hex literal has an odd number of digits");
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16);
+        let lo = (bytes[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+            _ => return err(format!("invalid hex in `{}`", s)),
+        }
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// Build a tagged hash value from a hash-function name and `0x`-prefixed hex digest.
+fn hash_literal(fnname: &str, hexword: &str) -> Result<HashValue, ParseError> {
+    let hex = hexword.strip_prefix("0x").ok_or(ParseError {
+        message: "hash literal digest must be 0x-prefixed".to_string(),
+    })?;
+    let bytes = decode_hex(hex)?;
+    let arr32 = || -> Result<[u8; 32], ParseError> {
+        bytes.clone().try_into().map_err(|_| ParseError {
+            message: format!("{} digest must be 32 bytes", fnname),
+        })
+    };
+    let arr20 = || -> Result<[u8; 20], ParseError> {
+        bytes.clone().try_into().map_err(|_| ParseError {
+            message: format!("{} digest must be 20 bytes", fnname),
+        })
+    };
+    Ok(match fnname {
+        "sha256" => HashValue::Sha256(arr32()?),
+        "hash256" => HashValue::Hash256(arr32()?),
+        "ripemd160" => HashValue::Ripemd160(arr20()?),
+        "hash160" => HashValue::Hash160(arr20()?),
+        _ => return err(format!("unknown hash function `{}`", fnname)),
+    })
+}
 
 /// An error produced while parsing a descriptor.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -64,6 +114,7 @@ enum Tok {
     RBracket,
     Comma,
     Eq,
+    Colon,
     Lt,
     Le,
     Gt,
@@ -102,6 +153,10 @@ fn lex(s: &str) -> Result<Vec<Tok>, ParseError> {
             }
             '=' => {
                 out.push(Tok::Eq);
+                i += 1;
+            }
+            ':' => {
+                out.push(Tok::Colon);
                 i += 1;
             }
             '<' => {
@@ -246,7 +301,18 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Word(w)) => {
                 let w = w.clone();
+                // hash literal: `sha256:0x...`
+                if is_hashfn(&w) && matches!(self.tokens.get(self.pos + 1), Some(Tok::Colon)) {
+                    self.pos += 1;
+                    self.expect(&Tok::Colon)?;
+                    let hexword = self.word()?;
+                    return Ok(Value::Hash(hash_literal(&w, &hexword)?));
+                }
                 self.pos += 1;
+                // bytes literal: `0x...`
+                if let Some(hex) = w.strip_prefix("0x") {
+                    return Ok(Value::Bytes(decode_hex(hex)?));
+                }
                 match Pk::from_str(&w) {
                     Ok(k) => Ok(Value::Key(k)),
                     Err(_) => Ok(Value::Bytes(w.into_bytes())),
@@ -444,6 +510,18 @@ impl<'a> Parser<'a> {
             Some(Tok::LBracket) => Ok(VTerm::Lit(self.literal()?)),
             Some(Tok::Word(w)) => {
                 let w = w.clone();
+                // hash literal: `sha256:0x...`
+                if is_hashfn(&w) && matches!(self.tokens.get(self.pos + 1), Some(Tok::Colon)) {
+                    self.pos += 1;
+                    self.expect(&Tok::Colon)?;
+                    let hexword = self.word()?;
+                    return Ok(VTerm::Lit(Value::Hash(hash_literal(&w, &hexword)?)));
+                }
+                // bytes literal: `0x...`
+                if let Some(hex) = w.strip_prefix("0x") {
+                    self.pos += 1;
+                    return Ok(VTerm::Lit(Value::Bytes(decode_hex(hex)?)));
+                }
                 // A word followed by `(` is a value-function application; otherwise it is a
                 // reference to a `with(...)` constant.
                 if matches!(self.tokens.get(self.pos + 1), Some(Tok::LParen)) {
