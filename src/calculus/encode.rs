@@ -49,6 +49,18 @@ impl CanonicalKey for bitcoin::PublicKey {
     }
 }
 
+impl CanonicalKey for bitcoin::secp256k1::XOnlyPublicKey {
+    fn to_canonical_bytes(&self) -> Vec<u8> { self.serialize().to_vec() }
+
+    fn from_canonical_bytes(bytes: &[u8]) -> Option<Self> {
+        // Canonical form is the 32-byte x-only serialization.
+        if bytes.len() != 32 {
+            return None;
+        }
+        bitcoin::secp256k1::XOnlyPublicKey::from_slice(bytes).ok()
+    }
+}
+
 /// The BIP-340 tagged hash `SHA256(SHA256(tag) || SHA256(tag) || msg)`.
 pub fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
     use bitcoin::hashes::{sha256, Hash as _};

@@ -154,3 +154,57 @@ fn descriptor_with_real_keys_round_trips_through_the_codec() {
     let back = decode_descriptor::<Pk>(&bytes).expect("decode");
     assert_eq!(d, back);
 }
+
+mod schnorr {
+    use super::*;
+    use bitcoin::secp256k1::{Keypair, XOnlyPublicKey};
+    use crate::calculus::secp::SchnorrVerifier;
+
+    type XPk = XOnlyPublicKey;
+
+    /// A deterministic x-only keypair from a seed byte.
+    fn xkeypair(seed: u8) -> (SecretKey, XPk) {
+        let ctx = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
+        let (xpk, _parity) = Keypair::from_secret_key(&ctx, &sk).x_only_public_key();
+        (sk, xpk)
+    }
+
+    struct XOp;
+    impl super::super::host::Operation<XPk> for XOp {
+        fn op_type(&self) -> Symbol { Symbol::new("spend") }
+        fn args(&self) -> Vec<(String, Value<XPk>)> {
+            vec![("amount".to_string(), Value::Int(100))]
+        }
+        fn deposit_id(&self) -> [u8; 32] { [0u8; 32] }
+        fn nonce(&self) -> u64 { 0 }
+        fn expiry(&self) -> u32 { u32::MAX }
+    }
+
+    #[test]
+    fn real_schnorr_authorizes_and_rejects() {
+        let v = SchnorrVerifier::new();
+        let (sk, xpk) = xkeypair(0x33);
+        let d = parse::<XPk>(&format!("prove(pk({}))", xpk)).unwrap();
+        let op = XOp;
+        let msg = super::super::encode::operation_preimage(&op);
+
+        // A real Schnorr signature authorizes.
+        let w = Witness::empty().with_signature(xpk, v.sign(&sk, &msg));
+        assert!(evaluate(&d, &op, &NoLedger, &w, &v).unwrap());
+
+        // A signature by a different key, placed under the expected key, is rejected.
+        let (sk_other, _) = xkeypair(0x44);
+        let w_bad = Witness::empty().with_signature(xpk, v.sign(&sk_other, &msg));
+        assert!(!evaluate(&d, &op, &NoLedger, &w_bad, &v).unwrap());
+    }
+
+    #[test]
+    fn schnorr_descriptor_round_trips_through_the_codec() {
+        use super::super::encode::{decode_descriptor, encode_descriptor};
+        let (_sk, xpk) = xkeypair(0x33);
+        let d = parse::<XPk>(&format!("prove(pk({}))", xpk)).unwrap();
+        let back = decode_descriptor::<XPk>(&encode_descriptor(&d)).unwrap();
+        assert_eq!(d, back);
+    }
+}

@@ -55,7 +55,7 @@ pub use self::parse::{parse, ParseError};
 pub use self::registry::{CmpOp, StatePred, Symbol, ValueFn};
 pub use self::schema::Schema;
 #[cfg(feature = "std")]
-pub use self::secp::EcdsaVerifier;
+pub use self::secp::{EcdsaVerifier, SchnorrVerifier};
 pub use self::signature::{Signature, Verifier};
 pub use self::snapshot::Snapshot;
 pub use self::value::{HashValue, Value};

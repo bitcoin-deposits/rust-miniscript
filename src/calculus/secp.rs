@@ -61,3 +61,51 @@ impl Verifier<PublicKey> for EcdsaVerifier {
         }
     }
 }
+
+/// A BIP-340 Schnorr verifier (and signer) over x-only public keys, for taproot-style descriptors.
+pub struct SchnorrVerifier {
+    secp: Secp256k1<All>,
+}
+
+impl Default for SchnorrVerifier {
+    fn default() -> Self { Self::new() }
+}
+
+impl SchnorrVerifier {
+    /// Construct a new verifier with its own secp256k1 context.
+    pub fn new() -> Self { SchnorrVerifier { secp: Secp256k1::new() } }
+
+    /// Produce a Schnorr signature by `sk` over `message`, in the 64-byte BIP-340 encoding this
+    /// verifier expects. Uses deterministic (no-aux-rand) nonces.
+    pub fn sign(&self, sk: &SecretKey, message: &[u8]) -> Signature {
+        let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&self.secp, sk);
+        let msg = Message::from_digest(operation_sighash(message));
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        Signature(sig.serialize().to_vec())
+    }
+}
+
+impl Verifier<bitcoin::secp256k1::XOnlyPublicKey> for SchnorrVerifier {
+    fn verify_signature(
+        &self,
+        key: &bitcoin::secp256k1::XOnlyPublicKey,
+        sig: &Signature,
+        message: &[u8],
+    ) -> bool {
+        let sig = match bitcoin::secp256k1::schnorr::Signature::from_slice(&sig.0) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let msg = Message::from_digest(operation_sighash(message));
+        self.secp.verify_schnorr(&sig, &msg, key).is_ok()
+    }
+
+    fn key_hashes_to(&self, key: &bitcoin::secp256k1::XOnlyPublicKey, keyhash: &HashValue) -> bool {
+        match keyhash {
+            HashValue::Hash160(d) => {
+                bitcoin::hashes::hash160::Hash::hash(&key.serialize()).to_byte_array() == *d
+            }
+            _ => false,
+        }
+    }
+}
