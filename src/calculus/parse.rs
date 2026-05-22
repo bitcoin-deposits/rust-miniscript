@@ -44,7 +44,7 @@ where
     Pk: MiniscriptKey + FromStr,
 {
     let tokens = lex(s)?;
-    let mut p = Parser { tokens: &tokens, pos: 0 };
+    let mut p = Parser { tokens: &tokens, pos: 0, bound: BTreeSet::new() };
     let d = p.descriptor()?;
     if p.pos != p.tokens.len() {
         return err(format!("trailing tokens after descriptor at position {}", p.pos));
@@ -122,18 +122,9 @@ fn lex(s: &str) -> Result<Vec<Tok>, ParseError> {
                     i += 1;
                 }
             }
-            c if c.is_ascii_digit() => {
-                let start = i;
-                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
-                    i += 1;
-                }
-                let text = &s[start..i];
-                let n: i128 = text
-                    .parse()
-                    .map_err(|_| ParseError { message: format!("bad integer `{}`", text) })?;
-                out.push(Tok::Num(n));
-            }
             c if c == '_' || c.is_ascii_alphanumeric() => {
+                // Consume a maximal alphanumeric/underscore run, then classify: an all-digit run is
+                // an integer; anything else (including hex keys that begin with a digit) is a word.
                 let start = i;
                 while i < bytes.len() {
                     let d = bytes[i] as char;
@@ -143,7 +134,15 @@ fn lex(s: &str) -> Result<Vec<Tok>, ParseError> {
                         break;
                     }
                 }
-                out.push(Tok::Word(s[start..i].to_string()));
+                let text = &s[start..i];
+                if text.bytes().all(|b| b.is_ascii_digit()) {
+                    let n: i128 = text
+                        .parse()
+                        .map_err(|_| ParseError { message: format!("bad integer `{}`", text) })?;
+                    out.push(Tok::Num(n));
+                } else {
+                    out.push(Tok::Word(text.to_string()));
+                }
             }
             other => return err(format!("unexpected character `{}`", other)),
         }
@@ -158,6 +157,9 @@ fn lex(s: &str) -> Result<Vec<Tok>, ParseError> {
 struct Parser<'a> {
     tokens: &'a [Tok],
     pos: usize,
+    /// Names bound by the enclosing `with(...)`. A bare word in value position resolves to a
+    /// constant reference if bound, and is otherwise parsed as a key literal.
+    bound: BTreeSet<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -204,6 +206,7 @@ impl<'a> Parser<'a> {
                 constants.insert(name, value);
                 self.expect(&Tok::Comma)?;
             }
+            self.bound = constants.keys().cloned().collect();
             let body = self.bterm()?;
             self.expect(&Tok::RParen)?;
             Ok(Descriptor { constants, body })
@@ -459,7 +462,16 @@ impl<'a> Parser<'a> {
                     Ok(VTerm::Op(f, args))
                 } else {
                     self.pos += 1;
-                    Ok(VTerm::Var(w))
+                    // A bound name is a constant reference; otherwise treat it as a key literal if
+                    // it parses as one, falling back to a (later unresolved) reference.
+                    if self.bound.contains(&w) {
+                        Ok(VTerm::Var(w))
+                    } else {
+                        match Pk::from_str(&w) {
+                            Ok(k) => Ok(VTerm::Lit(Value::Key(k))),
+                            Err(_) => Ok(VTerm::Var(w)),
+                        }
+                    }
                 }
             }
             t => err(format!("expected a value, found {:?}", t)),

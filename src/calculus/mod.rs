@@ -18,6 +18,9 @@
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "std"))]
+mod secp_tests;
+
 pub mod admission;
 pub mod ast;
 pub mod capability;
@@ -29,6 +32,8 @@ pub mod modify;
 pub mod parse;
 pub mod registry;
 pub mod schema;
+#[cfg(feature = "std")]
+pub mod secp;
 pub mod signature;
 pub mod value;
 pub mod witness;
@@ -43,6 +48,8 @@ pub use self::modify::{admit_modification, candidate, ModificationRejected, Modi
 pub use self::parse::{parse, ParseError};
 pub use self::registry::{CmpOp, StatePred, Symbol, ValueFn};
 pub use self::schema::Schema;
+#[cfg(feature = "std")]
+pub use self::secp::EcdsaVerifier;
 pub use self::signature::{Signature, Verifier};
 pub use self::value::{HashValue, Value};
 pub use self::witness::Witness;
