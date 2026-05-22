@@ -261,7 +261,10 @@ where
     };
     let arg_int = |i: usize| args[i].as_int().ok_or(EvalError::TypeMismatch("expected integer argument"));
     match p {
-        StatePred::Older => Ok(st.blocks_since_open() >= arg_int(0)?),
+        // `older` is a relative timelock: in Bitcoin it measures blocks since the coin was last
+        // moved (a spend resets it). The faithful ledger-model analog is blocks since the
+        // deposit's last activity, not its age since open.
+        StatePred::Older => Ok(st.blocks_since_activity() >= arg_int(0)?),
         StatePred::After => Ok(st.current_height() >= arg_int(0)?),
         StatePred::AmountAtMost => Ok(amount()? <= arg_int(0)?),
         StatePred::AmountInRange => Ok(amount()? >= arg_int(0)? && amount()? <= arg_int(1)?),

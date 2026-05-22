@@ -154,7 +154,8 @@ impl ValueFn {
 /// conditions because they cannot be exploited by withholding witness data.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum StatePred {
-    /// `older(n)`: a relative timelock has elapsed.
+    /// `older(n)`: a relative timelock has elapsed. In the ledger model this is blocks since the
+    /// deposit's last activity (the analog of Bitcoin CSV, which resets on every spend).
     Older,
     /// `after(n)`: an absolute height has been reached.
     After,

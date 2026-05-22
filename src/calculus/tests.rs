@@ -1171,13 +1171,14 @@ mod templates {
 
     // ----- Liana (decaying multisig) -----------------------------------------------------------
     // The primary path is a 2-of-2; a recovery key becomes spendable only after a span of
-    // inactivity. This is the Liana wallet shape, and the point is that the recovery timer
-    // *resets on every spend* — so it gates on blocks-since-activity, not coin age.
+    // inactivity. This is the Liana wallet shape, written with the idiomatic relative timelock
+    // `older` — which in the ledger model gates on blocks-since-activity, so the recovery timer
+    // *resets on every spend*, exactly as Bitcoin CSV does.
     const LIANA: &str = "
         with(primary_a = K1, primary_b = K2, recovery = K3, in match(operation_type(),
           branch(spend, or(
             and(prove(pk(primary_a)), prove(pk(primary_b))),
-            and(prove(pk(recovery)), blocks_since_activity_at_least(65535))
+            and(prove(pk(recovery)), older(65535))
           )),
           branch(else, false)
         ))";
