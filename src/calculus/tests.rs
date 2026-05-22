@@ -981,3 +981,72 @@ mod operation_codec {
         assert_eq!(decoded.subtree(), Some(BTerm::Const(false)));
     }
 }
+
+mod fraud_bundle {
+    use super::*;
+    use crate::calculus::fraud::{FraudProof, ReplayOutcome};
+    use crate::calculus::host::OperationData;
+    use crate::calculus::snapshot::Snapshot;
+
+    fn user_spend() -> OperationData<Pk> {
+        let mut args = BTreeMap::new();
+        args.insert("amount".to_string(), Value::Int(100));
+        args.insert("destination".to_string(), Value::Key("anywhere".to_string()));
+        OperationData {
+            op_type: Symbol::new("spend"),
+            args,
+            deposit_id: [7u8; 32],
+            nonce: 1,
+            expiry: 900_000,
+        }
+    }
+
+    fn proof(claimed: bool) -> FraudProof<Pk> {
+        let descriptor = parse::<Pk>(ALLOWANCE).unwrap();
+        let operation = user_spend();
+        let snapshot = Snapshot { balance: 1000, ..Snapshot::default() };
+        // The user (K1) signs the operation; the true verdict is accept.
+        let msg = operation_preimage(&operation);
+        let witness = Witness::empty().with_signature("K1".to_string(), mock_sig("K1", &msg));
+        FraudProof { descriptor, operation, snapshot, witness, claimed }
+    }
+
+    #[test]
+    fn bundle_round_trips() {
+        let fp = proof(true);
+        let bytes = fp.encode();
+        let back = FraudProof::<Pk>::decode(&bytes).expect("decode");
+        assert_eq!(fp, back);
+        assert_eq!(bytes, back.encode());
+    }
+
+    #[test]
+    fn adjudicate_confirms_a_correct_verdict() {
+        let fp = proof(true); // operator correctly claims accept
+        assert_eq!(fp.adjudicate(&MockVerifier).unwrap(), ReplayOutcome::Consistent);
+    }
+
+    #[test]
+    fn adjudicate_catches_a_false_claim() {
+        let fp = proof(false); // operator wrongly claims reject on a validly-signed op
+        assert_eq!(
+            fp.adjudicate(&MockVerifier).unwrap(),
+            ReplayOutcome::OperatorFault { computed: true, claimed: false },
+        );
+    }
+
+    #[test]
+    fn decode_through_then_adjudicate() {
+        // The full verifier path: receive bytes, decode, adjudicate.
+        let bytes = proof(true).encode();
+        let fp = FraudProof::<Pk>::decode(&bytes).unwrap();
+        assert_eq!(fp.adjudicate(&MockVerifier).unwrap(), ReplayOutcome::Consistent);
+    }
+
+    #[test]
+    fn trailing_bytes_in_bundle_are_rejected() {
+        let mut bytes = proof(true).encode();
+        bytes.push(0x00);
+        assert!(FraudProof::<Pk>::decode(&bytes).is_err());
+    }
+}

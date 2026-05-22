@@ -18,10 +18,13 @@ use crate::prelude::*;
 use crate::MiniscriptKey;
 
 use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::fraud::FraudProof;
 use super::host::Operation;
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
 use super::schema::Schema;
+use super::signature::Signature;
 use super::value::{HashValue, Value};
+use super::witness::Witness;
 
 /// A key type that has a fixed canonical byte serialization, required to encode and decode values
 /// and descriptors. Implemented for `bitcoin::PublicKey` (33-byte compressed) here; test key types
@@ -1062,4 +1065,125 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<super::snapshot::Snapshot, DecodeEr
         rolling,
         cumulative_spent,
     })
+}
+
+// ----------------------------------------------------------------------------------------------
+// witness and fraud-proof bundle encoding
+// ----------------------------------------------------------------------------------------------
+
+/// Canonical byte encoding of a witness. Signatures and attestations are sorted by key bytes;
+/// preimages are sorted by their tagged-hash key (the `BTreeMap` order, which matches the encoded
+/// order).
+pub fn encode_witness<Pk: MiniscriptKey + CanonicalKey>(w: &Witness<Pk>) -> Vec<u8> {
+    let mut out = vec![0x01]; // version
+
+    let mut sigs: Vec<(Vec<u8>, &Signature)> =
+        w.signatures.iter().map(|(k, s)| (k.to_canonical_bytes(), s)).collect();
+    sigs.sort_by(|a, b| a.0.cmp(&b.0));
+    put_u32(&mut out, sigs.len() as u32);
+    for (kb, sig) in &sigs {
+        put_bytes(&mut out, kb);
+        put_bytes(&mut out, &sig.0);
+    }
+
+    put_u32(&mut out, w.preimages.len() as u32);
+    for (hash, preimage) in &w.preimages {
+        put_hash(&mut out, hash);
+        put_bytes(&mut out, preimage);
+    }
+
+    let mut att: Vec<Vec<u8>> = w.attestations.iter().map(|k| k.to_canonical_bytes()).collect();
+    att.sort();
+    put_u32(&mut out, att.len() as u32);
+    for kb in &att {
+        put_bytes(&mut out, kb);
+    }
+    out
+}
+
+/// Decode a witness from its canonical encoding, rejecting unsorted or duplicated entries.
+pub fn decode_witness<Pk: MiniscriptKey + CanonicalKey>(
+    buf: &[u8],
+) -> Result<Witness<Pk>, DecodeError> {
+    let mut d = Decoder::new(buf);
+    if d.u8()? != 0x01 {
+        return Err(DecodeError::BadVersion(buf.first().copied().unwrap_or(0)));
+    }
+    let mut signatures = BTreeMap::new();
+    let n = d.u32()?;
+    let mut prev: Option<Vec<u8>> = None;
+    for _ in 0..n {
+        let kb = d.bytes()?;
+        let sig = Signature(d.bytes()?);
+        if let Some(prev) = &prev {
+            if &kb <= prev {
+                return Err(DecodeError::NonCanonicalOrder);
+            }
+        }
+        let key = Pk::from_canonical_bytes(&kb).ok_or(DecodeError::BadKey)?;
+        prev = Some(kb);
+        signatures.insert(key, sig);
+    }
+
+    let mut preimages = BTreeMap::new();
+    let m = d.u32()?;
+    let mut prev_h: Option<HashValue> = None;
+    for _ in 0..m {
+        let h = dec_hash(&mut d)?;
+        let preimage = d.bytes()?;
+        if let Some(prev) = &prev_h {
+            if &h <= prev {
+                return Err(DecodeError::NonCanonicalOrder);
+            }
+        }
+        prev_h = Some(h.clone());
+        preimages.insert(h, preimage);
+    }
+
+    let mut attestations = BTreeSet::new();
+    let a = d.u32()?;
+    let mut prev_a: Option<Vec<u8>> = None;
+    for _ in 0..a {
+        let kb = d.bytes()?;
+        if let Some(prev) = &prev_a {
+            if &kb <= prev {
+                return Err(DecodeError::NonCanonicalOrder);
+            }
+        }
+        let key = Pk::from_canonical_bytes(&kb).ok_or(DecodeError::BadKey)?;
+        prev_a = Some(kb);
+        attestations.insert(key);
+    }
+
+    d.finish()?;
+    Ok(Witness { signatures, preimages, attestations })
+}
+
+/// Canonical byte encoding of a fraud-proof bundle: each component is length-delimited, so the
+/// decoder can hand each sub-slice to its own canonical-rejecting decoder.
+pub fn encode_fraud_proof<Pk: MiniscriptKey + CanonicalKey>(fp: &FraudProof<Pk>) -> Vec<u8> {
+    let mut out = vec![0x01]; // version
+    put_bytes(&mut out, &encode_descriptor(&fp.descriptor));
+    put_bytes(&mut out, &operation_preimage(&fp.operation));
+    put_bytes(&mut out, &encode_snapshot(&fp.snapshot));
+    put_bytes(&mut out, &encode_witness(&fp.witness));
+    out.push(if fp.claimed { 1 } else { 0 });
+    out
+}
+
+/// Decode a fraud-proof bundle, rejecting non-canonical input in any component.
+pub fn decode_fraud_proof<Pk: MiniscriptKey + CanonicalKey>(
+    buf: &[u8],
+) -> Result<FraudProof<Pk>, DecodeError> {
+    let mut d = Decoder::new(buf);
+    if d.u8()? != 0x01 {
+        return Err(DecodeError::BadVersion(buf.first().copied().unwrap_or(0)));
+    }
+    let descriptor = decode_descriptor::<Pk>(&d.bytes()?)?;
+    let operation = decode_operation::<Pk>(&d.bytes()?)?;
+    let snapshot = decode_snapshot(&d.bytes()?)?;
+    let witness = decode_witness::<Pk>(&d.bytes()?)?;
+    let claimed = d.boolean()?;
+    d.finish()?;
+    Ok(FraudProof { descriptor, operation, snapshot, witness, claimed })
 }
