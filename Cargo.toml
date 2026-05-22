@@ -16,6 +16,7 @@ std = ["bitcoin/std", "bitcoin/secp-recovery", "bech32/std"]
 no-std = ["bech32/alloc"]
 compiler = []
 trace = []
+dep16 = []
 
 serde = ["actual-serde", "bitcoin/serde"]
 rand = ["bitcoin/rand"]

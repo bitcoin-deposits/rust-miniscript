@@ -1,0 +1,632 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Parser for the calculus surface syntax.
+//!
+//! The surface is miniscript-shaped — `combinator(arg, ...)` — extended with the `with(...)`
+//! constant-binding form, `[..]` list literals, and bare comparison operators as `cmp` arguments.
+//! These extensions need handling that the bare `expression::Tree` splitter does not provide (it
+//! does not track `[..]` nesting and treats `=` as an ordinary character), so this is a small
+//! self-contained recursive-descent parser over the same token shape.
+//!
+//! Dispatch is by combinator name into the correct sort: a name is looked up against the boolean
+//! combinators, the [`ValueFn`](super::registry::ValueFn) table, the
+//! [`StatePred`](super::registry::StatePred) table, and the obligation forms, in that order.
+
+use core::fmt;
+use core::str::FromStr;
+
+use crate::prelude::*;
+use crate::MiniscriptKey;
+
+use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
+use super::schema::Schema;
+use super::value::Value;
+
+/// An error produced while parsing a descriptor.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ParseError {
+    /// A human-readable description of the failure.
+    pub message: String,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str(&self.message) }
+}
+
+fn err<T>(msg: impl Into<String>) -> Result<T, ParseError> {
+    Err(ParseError { message: msg.into() })
+}
+
+/// Parse a descriptor from its source representation.
+pub fn parse<Pk>(s: &str) -> Result<Descriptor<Pk>, ParseError>
+where
+    Pk: MiniscriptKey + FromStr,
+{
+    let tokens = lex(s)?;
+    let mut p = Parser { tokens: &tokens, pos: 0 };
+    let d = p.descriptor()?;
+    if p.pos != p.tokens.len() {
+        return err(format!("trailing tokens after descriptor at position {}", p.pos));
+    }
+    Ok(d)
+}
+
+// ----------------------------------------------------------------------------------------------
+// Lexer
+// ----------------------------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Tok {
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    Comma,
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Word(String),
+    Num(i128),
+}
+
+fn lex(s: &str) -> Result<Vec<Tok>, ParseError> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            c if c.is_whitespace() => i += 1,
+            '(' => {
+                out.push(Tok::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(Tok::RParen);
+                i += 1;
+            }
+            '[' => {
+                out.push(Tok::LBracket);
+                i += 1;
+            }
+            ']' => {
+                out.push(Tok::RBracket);
+                i += 1;
+            }
+            ',' => {
+                out.push(Tok::Comma);
+                i += 1;
+            }
+            '=' => {
+                out.push(Tok::Eq);
+                i += 1;
+            }
+            '<' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    out.push(Tok::Le);
+                    i += 2;
+                } else {
+                    out.push(Tok::Lt);
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    out.push(Tok::Ge);
+                    i += 2;
+                } else {
+                    out.push(Tok::Gt);
+                    i += 1;
+                }
+            }
+            c if c.is_ascii_digit() => {
+                let start = i;
+                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                    i += 1;
+                }
+                let text = &s[start..i];
+                let n: i128 = text
+                    .parse()
+                    .map_err(|_| ParseError { message: format!("bad integer `{}`", text) })?;
+                out.push(Tok::Num(n));
+            }
+            c if c == '_' || c.is_ascii_alphanumeric() => {
+                let start = i;
+                while i < bytes.len() {
+                    let d = bytes[i] as char;
+                    if d == '_' || d.is_ascii_alphanumeric() {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.push(Tok::Word(s[start..i].to_string()));
+            }
+            other => return err(format!("unexpected character `{}`", other)),
+        }
+    }
+    Ok(out)
+}
+
+// ----------------------------------------------------------------------------------------------
+// Parser
+// ----------------------------------------------------------------------------------------------
+
+struct Parser<'a> {
+    tokens: &'a [Tok],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<&Tok> { self.tokens.get(self.pos) }
+
+    fn next(&mut self) -> Result<&'a Tok, ParseError> {
+        let t = self.tokens.get(self.pos).ok_or(ParseError {
+            message: "unexpected end of input".to_string(),
+        })?;
+        self.pos += 1;
+        Ok(t)
+    }
+
+    fn expect(&mut self, want: &Tok) -> Result<(), ParseError> {
+        match self.next()? {
+            t if t == want => Ok(()),
+            t => err(format!("expected {:?}, found {:?}", want, t)),
+        }
+    }
+
+    fn word(&mut self) -> Result<String, ParseError> {
+        match self.next()? {
+            Tok::Word(w) => Ok(w.clone()),
+            t => err(format!("expected an identifier, found {:?}", t)),
+        }
+    }
+
+    fn descriptor<Pk>(&mut self) -> Result<Descriptor<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        if matches!(self.peek(), Some(Tok::Word(w)) if w == "with") {
+            self.pos += 1;
+            self.expect(&Tok::LParen)?;
+            let mut constants = BTreeMap::new();
+            loop {
+                if matches!(self.peek(), Some(Tok::Word(w)) if w == "in") {
+                    self.pos += 1;
+                    break;
+                }
+                let name = self.word()?;
+                self.expect(&Tok::Eq)?;
+                let value = self.literal()?;
+                constants.insert(name, value);
+                self.expect(&Tok::Comma)?;
+            }
+            let body = self.bterm()?;
+            self.expect(&Tok::RParen)?;
+            Ok(Descriptor { constants, body })
+        } else {
+            let body = self.bterm()?;
+            Ok(Descriptor { constants: BTreeMap::new(), body })
+        }
+    }
+
+    /// A literal value, used on the right of a `with(...)` binding.
+    fn literal<Pk>(&mut self) -> Result<Value<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        match self.peek() {
+            Some(Tok::LBracket) => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                if !matches!(self.peek(), Some(Tok::RBracket)) {
+                    loop {
+                        items.push(self.literal()?);
+                        match self.next()? {
+                            Tok::Comma => {}
+                            Tok::RBracket => break,
+                            t => return err(format!("expected `,` or `]`, found {:?}", t)),
+                        }
+                    }
+                } else {
+                    self.pos += 1;
+                }
+                Ok(Value::List(items))
+            }
+            Some(Tok::Num(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok(Value::Int(n))
+            }
+            Some(Tok::Word(w)) => {
+                let w = w.clone();
+                self.pos += 1;
+                match Pk::from_str(&w) {
+                    Ok(k) => Ok(Value::Key(k)),
+                    Err(_) => Ok(Value::Bytes(w.into_bytes())),
+                }
+            }
+            t => err(format!("expected a literal, found {:?}", t)),
+        }
+    }
+
+    fn bterm<Pk>(&mut self) -> Result<BTerm<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        let name = self.word()?;
+        match name.as_str() {
+            "true" => return Ok(BTerm::Const(true)),
+            "false" => return Ok(BTerm::Const(false)),
+            _ => {}
+        }
+        self.expect(&Tok::LParen)?;
+        let result = match name.as_str() {
+            "and" => BTerm::And(self.bterm_list()?),
+            "or" => BTerm::Or(self.bterm_list()?),
+            "thresh" => {
+                let k = self.num()? as usize;
+                self.expect(&Tok::Comma)?;
+                BTerm::Thresh(k, self.bterm_list()?)
+            }
+            "not" => {
+                let b = self.bterm()?;
+                self.expect(&Tok::RParen)?;
+                BTerm::Not(Box::new(b))
+            }
+            "if" => {
+                let c = self.bterm()?;
+                self.expect(&Tok::Comma)?;
+                let t = self.bterm()?;
+                self.expect(&Tok::Comma)?;
+                let e = self.bterm()?;
+                self.expect(&Tok::RParen)?;
+                BTerm::If(Box::new(c), Box::new(t), Box::new(e))
+            }
+            "match" => self.match_term()?,
+            "cmp" => {
+                let op = self.cmpop()?;
+                self.expect(&Tok::Comma)?;
+                let a = self.vterm()?;
+                self.expect(&Tok::Comma)?;
+                let b = self.vterm()?;
+                self.expect(&Tok::RParen)?;
+                BTerm::Cmp(op, a, b)
+            }
+            "prove" => {
+                let o = self.obligation()?;
+                self.expect(&Tok::RParen)?;
+                BTerm::Prove(o)
+            }
+            other => {
+                if let Some(pred) = StatePred::from_name(other) {
+                    let args = self.vterm_list()?;
+                    BTerm::State(pred, args)
+                } else {
+                    return err(format!("unknown boolean combinator `{}`", other));
+                }
+            }
+        };
+        Ok(result)
+    }
+
+    fn bterm_list<Pk>(&mut self) -> Result<Vec<BTerm<Pk>>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        let mut out = Vec::new();
+        if matches!(self.peek(), Some(Tok::RParen)) {
+            self.pos += 1;
+            return Ok(out);
+        }
+        loop {
+            out.push(self.bterm()?);
+            match self.next()? {
+                Tok::Comma => {}
+                Tok::RParen => break,
+                t => return err(format!("expected `,` or `)`, found {:?}", t)),
+            }
+        }
+        Ok(out)
+    }
+
+    fn match_term<Pk>(&mut self) -> Result<BTerm<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        let scrutinee = self.vterm()?;
+        self.expect(&Tok::Comma)?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        loop {
+            let kw = self.word()?;
+            if kw != "branch" {
+                return err(format!("expected `branch`, found `{}`", kw));
+            }
+            self.expect(&Tok::LParen)?;
+            let tag = self.word()?;
+            self.expect(&Tok::Comma)?;
+            let body = self.bterm()?;
+            self.expect(&Tok::RParen)?;
+            if tag == "else" {
+                default = Some(Box::new(body));
+            } else {
+                arms.push((Symbol::new(tag), body));
+            }
+            match self.next()? {
+                Tok::Comma => {}
+                Tok::RParen => break,
+                t => return err(format!("expected `,` or `)`, found {:?}", t)),
+            }
+        }
+        match default {
+            Some(default) => Ok(BTerm::Match { scrutinee, arms, default }),
+            None => err("match is missing an `else` branch"),
+        }
+    }
+
+    fn obligation<Pk>(&mut self) -> Result<Obligation<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        let name = self.word()?;
+        self.expect(&Tok::LParen)?;
+        let result = match name.as_str() {
+            "pk" => {
+                let v = self.vterm()?;
+                self.expect(&Tok::RParen)?;
+                Obligation::Pk(v)
+            }
+            "pk_h" => {
+                let v = self.vterm()?;
+                self.expect(&Tok::RParen)?;
+                Obligation::PkH(v)
+            }
+            "pk_any" => {
+                let v = self.vterm()?;
+                self.expect(&Tok::RParen)?;
+                Obligation::PkAny(v)
+            }
+            "pk_threshold" => {
+                let k = self.num()? as usize;
+                self.expect(&Tok::Comma)?;
+                let v = self.vterm()?;
+                self.expect(&Tok::RParen)?;
+                Obligation::PkThreshold(k, v)
+            }
+            "hashlock" => {
+                let v = self.vterm()?;
+                self.expect(&Tok::RParen)?;
+                Obligation::Hashlock(v)
+            }
+            "attest" => {
+                let key = self.vterm()?;
+                self.expect(&Tok::Comma)?;
+                let schema = self.schema()?;
+                self.expect(&Tok::RParen)?;
+                Obligation::Attest(key, schema)
+            }
+            other => return err(format!("unknown proof obligation `{}`", other)),
+        };
+        Ok(result)
+    }
+
+    fn schema(&mut self) -> Result<Schema, ParseError> {
+        let name = self.word()?;
+        self.expect(&Tok::LParen)?;
+        let result = match name.as_str() {
+            "price_schema" => {
+                let n = self.num()?;
+                self.expect(&Tok::RParen)?;
+                Schema::PriceWithinBps { tolerance_bps: n as u32 }
+            }
+            other => return err(format!("unknown schema `{}`", other)),
+        };
+        Ok(result)
+    }
+
+    fn vterm<Pk>(&mut self) -> Result<VTerm<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        match self.peek() {
+            Some(Tok::Num(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok(VTerm::Lit(Value::Int(n)))
+            }
+            Some(Tok::LBracket) => Ok(VTerm::Lit(self.literal()?)),
+            Some(Tok::Word(w)) => {
+                let w = w.clone();
+                // A word followed by `(` is a value-function application; otherwise it is a
+                // reference to a `with(...)` constant.
+                if matches!(self.tokens.get(self.pos + 1), Some(Tok::LParen)) {
+                    self.pos += 1; // consume the word
+                    self.expect(&Tok::LParen)?;
+                    let f = ValueFn::from_name(&w)
+                        .ok_or(ParseError { message: format!("unknown value function `{}`", w) })?;
+                    let args = if f == ValueFn::OperationArg {
+                        // operation_arg's argument is a field symbol, not a constant reference.
+                        let sym = self.word()?;
+                        self.expect(&Tok::RParen)?;
+                        vec![VTerm::Lit(Value::Symbol(Symbol::new(sym)))]
+                    } else {
+                        self.vterm_list()?
+                    };
+                    Ok(VTerm::Op(f, args))
+                } else {
+                    self.pos += 1;
+                    Ok(VTerm::Var(w))
+                }
+            }
+            t => err(format!("expected a value, found {:?}", t)),
+        }
+    }
+
+    fn vterm_list<Pk>(&mut self) -> Result<Vec<VTerm<Pk>>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        let mut out = Vec::new();
+        if matches!(self.peek(), Some(Tok::RParen)) {
+            self.pos += 1;
+            return Ok(out);
+        }
+        loop {
+            out.push(self.vterm()?);
+            match self.next()? {
+                Tok::Comma => {}
+                Tok::RParen => break,
+                t => return err(format!("expected `,` or `)`, found {:?}", t)),
+            }
+        }
+        Ok(out)
+    }
+
+    fn num(&mut self) -> Result<i128, ParseError> {
+        match self.next()? {
+            Tok::Num(n) => Ok(*n),
+            t => err(format!("expected an integer, found {:?}", t)),
+        }
+    }
+
+    fn cmpop(&mut self) -> Result<CmpOp, ParseError> {
+        match self.next()? {
+            Tok::Eq => Ok(CmpOp::Eq),
+            Tok::Lt => Ok(CmpOp::Lt),
+            Tok::Le => Ok(CmpOp::Le),
+            Tok::Gt => Ok(CmpOp::Gt),
+            Tok::Ge => Ok(CmpOp::Ge),
+            t => err(format!("expected a comparison operator, found {:?}", t)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALLOWANCE: &str = "
+        with(
+          user = K1,
+          delegate = K2,
+          guardians = [K3, K4, K5],
+          recovery_to = D1,
+          in match(operation_type(),
+            branch(spend,
+              or(
+                prove(pk(user)),
+                and(
+                  prove(pk(delegate)),
+                  amount_at_most_pct(10),
+                  rolling_amount_below_pct(30, 4320)
+                ),
+                and(
+                  prove(pk_threshold(2, guardians)),
+                  blocks_since_activity_at_least(4320),
+                  destination_is(recovery_to)
+                )
+              )
+            ),
+            branch(insert, prove(pk(user))),
+            branch(replace, prove(pk(user))),
+            branch(delete, prove(pk(user))),
+            branch(else, false)
+          )
+        )";
+
+    const ORACLE: &str = "
+        with(
+          user = K1,
+          rebalancer = K2,
+          oracle = K3,
+          counterparty = D1,
+          in match(operation_type(),
+            branch(spend,
+              or(
+                prove(pk(user)),
+                and(
+                  prove(pk(rebalancer)),
+                  destination_is(counterparty),
+                  prove(attest(oracle, price_schema(50)))
+                )
+              )
+            ),
+            branch(else, false)
+          )
+        )";
+
+    const ROTATION: &str = "
+        with(
+          user = K1,
+          guardians = [G1, G2, G3, G4],
+          in match(operation_type(),
+            branch(spend, prove(pk(user))),
+            branch(replace,
+              or(
+                prove(pk(user)),
+                and(
+                  prove(pk_threshold(3, guardians)),
+                  blocks_since_activity_at_least(8640),
+                  cmp(=, operation_path(), path(0))
+                )
+              )
+            ),
+            branch(else, false)
+          )
+        )";
+
+    fn parse_ok(s: &str) -> Descriptor<String> {
+        parse::<String>(s).unwrap_or_else(|e| panic!("parse failed: {}", e))
+    }
+
+    #[test]
+    fn parses_allowance_example() {
+        let d = parse_ok(ALLOWANCE);
+        assert_eq!(d.constants.len(), 4);
+        assert_eq!(d.constants.get("user"), Some(&Value::Key("K1".to_string())));
+        match d.constants.get("guardians") {
+            Some(Value::List(ks)) => assert_eq!(ks.len(), 3),
+            other => panic!("guardians not a 3-list: {:?}", other),
+        }
+        match &d.body {
+            BTerm::Match { arms, .. } => assert_eq!(arms.len(), 4), // spend/insert/replace/delete
+            other => panic!("body not a match: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_oracle_example() {
+        let d = parse_ok(ORACLE);
+        assert_eq!(d.constants.len(), 4);
+        // The rebalancer branch carries an oracle attestation with a 50bps schema.
+        let found = format!("{:?}", d.body).contains("PriceWithinBps { tolerance_bps: 50 }");
+        assert!(found, "expected a 50bps price schema in the parsed body");
+    }
+
+    #[test]
+    fn parses_rotation_example() {
+        let d = parse_ok(ROTATION);
+        assert_eq!(d.constants.len(), 2);
+        match d.constants.get("guardians") {
+            Some(Value::List(ks)) => assert_eq!(ks.len(), 4),
+            other => panic!("guardians not a 4-list: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_match_without_else() {
+        let r = parse::<String>("match(operation_type(), branch(spend, true))");
+        assert!(r.is_err(), "match without else should fail");
+    }
+
+    #[test]
+    fn parses_bare_expression_without_with() {
+        let d = parse::<String>("prove(pk(user_key))").unwrap();
+        assert!(d.constants.is_empty());
+        assert!(matches!(d.body, BTerm::Prove(Obligation::Pk(_))));
+    }
+}

@@ -120,6 +120,8 @@ mod macros;
 mod pub_macros;
 
 mod blanket_traits;
+#[cfg(feature = "dep16")]
+pub mod calculus;
 pub mod descriptor;
 pub mod expression;
 pub mod interpreter;
