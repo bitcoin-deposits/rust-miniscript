@@ -18,7 +18,8 @@ use crate::MiniscriptKey;
 use super::ast::{BTerm, Obligation, VTerm};
 use super::host::{LedgerState, Operation};
 use super::registry::{CmpOp, StatePred, ValueFn};
-use super::value::{bps, floor_div, pct, sat_add, sat_mul, sat_sub, Value};
+use super::signature::Verifier;
+use super::value::{bps, floor_div, pct, sat_add, sat_mul, sat_sub, HashValue, Value};
 use super::witness::Witness;
 
 /// A constant environment: the bindings from a descriptor's `with(...)`.
@@ -37,23 +38,29 @@ pub enum EvalError {
 }
 
 /// Evaluate a boolean term to a verdict.
-pub fn eval_b<Pk, O, L>(
+///
+/// `w` and `verifier` are the only witness-dependent inputs; they reach the leaves solely through
+/// [`verify_o`]. [`eval_v`] and [`eval_state`] do not receive them, so values and state predicates
+/// are constant in the witness by construction.
+pub fn eval_b<Pk, O, L, V>(
     t: &BTerm<Pk>,
     env: &Env<Pk>,
     op: &O,
     st: &L,
     w: &Witness<Pk>,
+    verifier: &V,
 ) -> Result<bool, EvalError>
 where
     Pk: MiniscriptKey,
     O: Operation<Pk>,
     L: LedgerState,
+    V: Verifier<Pk>,
 {
     match t {
         BTerm::Const(b) => Ok(*b),
         BTerm::And(bs) => {
             for b in bs {
-                if !eval_b(b, env, op, st, w)? {
+                if !eval_b(b, env, op, st, w, verifier)? {
                     return Ok(false);
                 }
             }
@@ -61,7 +68,7 @@ where
         }
         BTerm::Or(bs) => {
             for b in bs {
-                if eval_b(b, env, op, st, w)? {
+                if eval_b(b, env, op, st, w, verifier)? {
                     return Ok(true);
                 }
             }
@@ -70,18 +77,18 @@ where
         BTerm::Thresh(k, bs) => {
             let mut count = 0;
             for b in bs {
-                if eval_b(b, env, op, st, w)? {
+                if eval_b(b, env, op, st, w, verifier)? {
                     count += 1;
                 }
             }
             Ok(count >= *k)
         }
-        BTerm::Not(b) => Ok(!eval_b(b, env, op, st, w)?),
+        BTerm::Not(b) => Ok(!eval_b(b, env, op, st, w, verifier)?),
         BTerm::If(c, then_, els) => {
-            if eval_b(c, env, op, st, w)? {
-                eval_b(then_, env, op, st, w)
+            if eval_b(c, env, op, st, w, verifier)? {
+                eval_b(then_, env, op, st, w, verifier)
             } else {
-                eval_b(els, env, op, st, w)
+                eval_b(els, env, op, st, w, verifier)
             }
         }
         BTerm::Match { scrutinee, arms, default } => {
@@ -89,10 +96,10 @@ where
             let sym = key.as_symbol().ok_or(EvalError::TypeMismatch("match scrutinee not a symbol"))?;
             for (tag, body) in arms {
                 if tag == sym {
-                    return eval_b(body, env, op, st, w);
+                    return eval_b(body, env, op, st, w, verifier);
                 }
             }
-            eval_b(default, env, op, st, w)
+            eval_b(default, env, op, st, w, verifier)
         }
         BTerm::Cmp(o, a, b) => {
             let av = eval_v(a, env, op, st)?;
@@ -106,7 +113,7 @@ where
             }
             eval_state(*p, &vals, op, st)
         }
-        BTerm::Prove(o) => verify_o(o, env, w, op, st),
+        BTerm::Prove(o) => verify_o(o, env, w, verifier, op, st),
     }
 }
 
@@ -256,10 +263,11 @@ fn eval_cmp<Pk: MiniscriptKey>(o: CmpOp, a: &Value<Pk>, b: &Value<Pk>) -> Result
 }
 
 /// Discharge a proof obligation against the witness. The only witness-dependent evaluation.
-pub fn verify_o<Pk, O, L>(
+pub fn verify_o<Pk, O, L, V>(
     o: &Obligation<Pk>,
     env: &Env<Pk>,
     w: &Witness<Pk>,
+    verifier: &V,
     op: &O,
     st: &L,
 ) -> Result<bool, EvalError>
@@ -267,6 +275,7 @@ where
     Pk: MiniscriptKey,
     O: Operation<Pk>,
     L: LedgerState,
+    V: Verifier<Pk>,
 {
     let as_key = |v: &VTerm<Pk>| -> Result<Pk, EvalError> {
         match eval_v(v, env, op, st)? {
@@ -286,17 +295,55 @@ where
             _ => Err(EvalError::TypeMismatch("expected a list of keys")),
         }
     };
+    // A signature by `key` is valid iff the witness carries an entry under that key that the
+    // verifier accepts over the operation's signing message.
+    let signed_by = |key: &Pk| -> bool {
+        match w.signatures.get(key) {
+            Some(sig) => verifier.verify_signature(key, sig, &op.signing_message()),
+            None => false,
+        }
+    };
     match o {
-        Obligation::Pk(v) => Ok(w.has_signature(&as_key(v)?)),
-        Obligation::PkAny(v) => Ok(as_keys(v)?.iter().any(|k| w.has_signature(k))),
+        Obligation::Pk(v) => Ok(signed_by(&as_key(v)?)),
+        Obligation::PkAny(v) => Ok(as_keys(v)?.iter().any(signed_by)),
         Obligation::PkThreshold(k, v) => {
             let mut keys = as_keys(v)?;
             keys.sort();
             keys.dedup();
-            Ok(keys.iter().filter(|k| w.has_signature(k)).count() >= *k)
+            Ok(keys.iter().filter(|k| signed_by(k)).count() >= *k)
         }
-        Obligation::Attest(key, _schema) => Ok(w.attestors.contains(&as_key(key)?)),
-        Obligation::PkH(_) => Err(EvalError::Unsupported("pk_h (phase 3)")),
-        Obligation::Hashlock(_) => Err(EvalError::Unsupported("hashlock (phase 3)")),
+        Obligation::PkH(v) => {
+            let keyhash = match eval_v(v, env, op, st)? {
+                Value::Hash(h) => h,
+                _ => return Err(EvalError::TypeMismatch("pk_h expects a key hash")),
+            };
+            // Find a witnessed key that hashes to `keyhash` and whose signature verifies.
+            let msg = op.signing_message();
+            Ok(w.signatures.iter().any(|(k, sig)| {
+                verifier.key_hashes_to(k, &keyhash) && verifier.verify_signature(k, sig, &msg)
+            }))
+        }
+        Obligation::Hashlock(v) => {
+            let h = match eval_v(v, env, op, st)? {
+                Value::Hash(h) => h,
+                _ => return Err(EvalError::TypeMismatch("hashlock expects a hash")),
+            };
+            Ok(match w.preimages.get(&h) {
+                Some(preimage) => hash_matches(&h, preimage),
+                None => false,
+            })
+        }
+        Obligation::Attest(key, _schema) => Ok(w.attestations.contains(&as_key(key)?)),
+    }
+}
+
+/// Whether `preimage` hashes to `h` under the function `h` is tagged with.
+fn hash_matches(h: &HashValue, preimage: &[u8]) -> bool {
+    use bitcoin::hashes::{hash160, ripemd160, sha256, Hash as _};
+    match h {
+        HashValue::Sha256(d) => sha256::Hash::hash(preimage).to_byte_array() == *d,
+        HashValue::Hash256(d) => crate::hash256::Hash::hash(preimage).to_byte_array() == *d,
+        HashValue::Ripemd160(d) => ripemd160::Hash::hash(preimage).to_byte_array() == *d,
+        HashValue::Hash160(d) => hash160::Hash::hash(preimage).to_byte_array() == *d,
     }
 }

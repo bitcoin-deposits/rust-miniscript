@@ -26,6 +26,7 @@ pub mod host;
 pub mod parse;
 pub mod registry;
 pub mod schema;
+pub mod signature;
 pub mod value;
 pub mod witness;
 
@@ -37,5 +38,6 @@ pub use self::host::{LedgerState, Operation};
 pub use self::parse::{parse, ParseError};
 pub use self::registry::{CmpOp, StatePred, Symbol, ValueFn};
 pub use self::schema::Schema;
+pub use self::signature::{Signature, Verifier};
 pub use self::value::{HashValue, Value};
 pub use self::witness::Witness;

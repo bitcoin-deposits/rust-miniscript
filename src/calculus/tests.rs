@@ -8,10 +8,47 @@ use super::eval::eval_b;
 use super::host::{LedgerState, Operation};
 use super::parse::parse;
 use super::registry::Symbol;
-use super::value::Value;
+use super::signature::{Signature, Verifier};
+use super::value::{HashValue, Value};
 use super::witness::Witness;
 
 type Pk = String;
+
+/// The mock signature scheme used throughout the tests: a valid signature by `key` over `msg` is
+/// the bytes `key | "|" | msg`. This binds a signature to both the key and the exact operation
+/// message, so a signature for one operation does not verify against another.
+fn mock_sig(key: &str, msg: &[u8]) -> Signature {
+    let mut bytes = key.as_bytes().to_vec();
+    bytes.push(b'|');
+    bytes.extend_from_slice(msg);
+    Signature(bytes)
+}
+
+/// A verifier for the mock scheme. `key_hashes_to` matches a key against the hash160 of its bytes.
+struct MockVerifier;
+
+impl Verifier<Pk> for MockVerifier {
+    fn verify_signature(&self, key: &Pk, sig: &Signature, message: &[u8]) -> bool {
+        *sig == mock_sig(key, message)
+    }
+    fn key_hashes_to(&self, key: &Pk, keyhash: &HashValue) -> bool {
+        use bitcoin::hashes::{hash160, Hash as _};
+        match keyhash {
+            HashValue::Hash160(d) => hash160::Hash::hash(key.as_bytes()).to_byte_array() == *d,
+            _ => false,
+        }
+    }
+}
+
+/// Build a witness signing `op` with each of `signers` under the mock scheme.
+fn witness_signed_by(op: &MockOp, signers: &[&str]) -> Witness<Pk> {
+    let msg = op.signing_message();
+    let mut w = Witness::empty();
+    for s in signers {
+        w = w.with_signature(s.to_string(), mock_sig(s, &msg));
+    }
+    w
+}
 
 /// A mock operation: a type tag and a bag of named arguments.
 struct MockOp {
@@ -34,6 +71,11 @@ impl Operation<Pk> for MockOp {
     fn arg(&self, name: &str) -> Option<Value<Pk>> { self.args.get(name).cloned() }
     fn path(&self) -> Option<Vec<usize>> { None }
     fn subtree(&self) -> Option<super::ast::BTerm<Pk>> { None }
+    fn signing_message(&self) -> Vec<u8> {
+        // A deterministic encoding binding the operation type and its arguments. The real
+        // canonical encoding is specified elsewhere; this suffices to bind signatures in tests.
+        format!("op={};args={:?}", self.ty, self.args).into_bytes()
+    }
 }
 
 /// A mock ledger snapshot.
@@ -97,8 +139,8 @@ const ALLOWANCE: &str = "
 
 fn decide(src: &str, op: &MockOp, st: &MockLedger, signers: &[&str]) -> bool {
     let d = parse::<Pk>(src).expect("parse");
-    let w = Witness::signed_by(signers.iter().map(|s| s.to_string()));
-    eval_b(&d.body, &d.constants, op, st, &w).expect("eval")
+    let w = witness_signed_by(op, signers);
+    eval_b(&d.body, &d.constants, op, st, &w, &MockVerifier).expect("eval")
 }
 
 #[test]
@@ -320,15 +362,12 @@ mod monotonicity {
     }
 
     fn accept(term: &BTerm<Pk>, mask: u8) -> bool {
-        let signers: Vec<String> = (0..4)
-            .filter(|i| mask & (1 << i) != 0)
-            .map(|i| KEYS[i].to_string())
-            .collect();
-        let w = Witness::signed_by(signers);
         let op = MockOp::spend(1, "x");
         let st = MockLedger::default();
+        let signers: Vec<&str> = (0..4).filter(|i| mask & (1 << i) != 0).map(|i| KEYS[i]).collect();
+        let w = super::witness_signed_by(&op, &signers);
         let env = BTreeMap::new();
-        eval_b(term, &env, &op, &st, &w).expect("generated terms never error")
+        eval_b(term, &env, &op, &st, &w, &super::MockVerifier).expect("generated terms never error")
     }
 
     #[test]
@@ -366,5 +405,75 @@ mod monotonicity {
         // The test must actually exercise both paths to be meaningful.
         assert!(admitted > 50, "too few admitted terms ({}); test is near-vacuous", admitted);
         assert!(rejected > 0, "generator produced no negative-position proofs to reject");
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Phase 3: real signatures, hashlocks, pk_h
+// ----------------------------------------------------------------------------------------------
+
+mod proofs {
+    use super::*;
+    use crate::calculus::ast::{BTerm, Descriptor, Obligation, VTerm};
+    use bitcoin::hashes::{hash160, sha256, Hash as _};
+
+    #[test]
+    fn signature_binds_to_the_operation() {
+        let d = parse::<Pk>(
+            "with(user = K1, in match(operation_type(), branch(spend, prove(pk(user))), branch(else, false)))",
+        )
+        .unwrap();
+        let op_a = MockOp::spend(100, "alice");
+        let op_b = MockOp::spend(999, "bob");
+        let st = MockLedger::default();
+        // The witness signs op_a's message.
+        let w = witness_signed_by(&op_a, &["K1"]);
+
+        // It authorizes the operation it was signed for...
+        assert!(eval_b(&d.body, &d.constants, &op_a, &st, &w, &MockVerifier).unwrap());
+        // ...but not a different operation, even with the same key present.
+        assert!(!eval_b(&d.body, &d.constants, &op_b, &st, &w, &MockVerifier).unwrap());
+    }
+
+    #[test]
+    fn hashlock_requires_a_matching_preimage() {
+        let preimage = b"open sesame".to_vec();
+        let digest = HashValue::Sha256(sha256::Hash::hash(&preimage).to_byte_array());
+        let body: BTerm<Pk> =
+            BTerm::Prove(Obligation::Hashlock(VTerm::Lit(Value::Hash(digest.clone()))));
+        let d = Descriptor { constants: BTreeMap::new(), body };
+        let op = MockOp::spend(1, "x");
+        let st = MockLedger::default();
+
+        // No preimage: rejected.
+        let empty = Witness::empty();
+        assert!(!eval_b(&d.body, &d.constants, &op, &st, &empty, &MockVerifier).unwrap());
+
+        // Correct preimage revealed: accepted.
+        let w = Witness::empty().with_preimage(digest.clone(), preimage);
+        assert!(eval_b(&d.body, &d.constants, &op, &st, &w, &MockVerifier).unwrap());
+
+        // Wrong preimage under the same hash key: rejected (re-hash check fails).
+        let w_bad = Witness::empty().with_preimage(digest, b"wrong".to_vec());
+        assert!(!eval_b(&d.body, &d.constants, &op, &st, &w_bad, &MockVerifier).unwrap());
+    }
+
+    #[test]
+    fn pk_h_matches_a_revealed_key_by_hash() {
+        let key = "K1";
+        let keyhash = HashValue::Hash160(hash160::Hash::hash(key.as_bytes()).to_byte_array());
+        let body: BTerm<Pk> =
+            BTerm::Prove(Obligation::PkH(VTerm::Lit(Value::Hash(keyhash))));
+        let d = Descriptor { constants: BTreeMap::new(), body };
+        let op = MockOp::spend(1, "x");
+        let st = MockLedger::default();
+
+        // A signature by the key whose hash matches: accepted.
+        let w = witness_signed_by(&op, &[key]);
+        assert!(eval_b(&d.body, &d.constants, &op, &st, &w, &MockVerifier).unwrap());
+
+        // A signature by a different key: rejected.
+        let w_other = witness_signed_by(&op, &["K2"]);
+        assert!(!eval_b(&d.body, &d.constants, &op, &st, &w_other, &MockVerifier).unwrap());
     }
 }

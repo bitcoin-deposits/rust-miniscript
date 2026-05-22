@@ -28,6 +28,12 @@ pub trait Operation<Pk: MiniscriptKey> {
 
     /// The subtree introduced by an `insert` or `replace`, if this is one.
     fn subtree(&self) -> Option<BTerm<Pk>>;
+
+    /// The canonical message a signature over this operation commits to. The exact encoding (which
+    /// binds the deposit id, operation type, arguments, nonce, and expiry) is fixed by the
+    /// canonical-encoding specification; the evaluator treats it as opaque bytes that signatures
+    /// are checked against.
+    fn signing_message(&self) -> Vec<u8>;
 }
 
 /// A snapshot of the deposit's ledger state at the time of authorization. All quantities are
