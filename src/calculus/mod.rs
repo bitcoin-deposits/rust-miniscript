@@ -42,8 +42,8 @@ pub use self::admission::{admit, check_polarity, AdmissionError};
 pub use self::ast::{BTerm, Descriptor, Obligation, VTerm};
 pub use self::capability::{CapabilitySet, ObligationKind};
 pub use self::encode::{
-    descriptor_id, encode_descriptor, operation_preimage, operation_sighash, tagged_hash,
-    CanonicalKey,
+    decode_descriptor, descriptor_id, encode_descriptor, operation_preimage, operation_sighash,
+    tagged_hash, CanonicalKey, DecodeError,
 };
 pub use self::eval::{eval_b, evaluate, Env, EvalError};
 pub use self::fraud::{replay, ReplayOutcome};

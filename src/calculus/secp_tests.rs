@@ -151,3 +151,14 @@ fn real_pk_h_matches_hash160_of_the_key() {
     let w_other = Witness::empty().with_signature(pk_other, v.sign(&sk_other, &msg));
     assert!(!evaluate(&d, &op, &NoLedger, &w_other, &v).unwrap());
 }
+
+#[test]
+fn descriptor_with_real_keys_round_trips_through_the_codec() {
+    use super::encode::{decode_descriptor, encode_descriptor};
+    let (_sk, pk) = keypair(0x11);
+    let d = parse::<Pk>(&format!("prove(pk({}))", pk)).unwrap();
+    let bytes = encode_descriptor(&d);
+    // The 33-byte compressed key survives the encode/decode round-trip.
+    let back = decode_descriptor::<Pk>(&bytes).expect("decode");
+    assert_eq!(d, back);
+}

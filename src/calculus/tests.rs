@@ -17,6 +17,7 @@ type Pk = String;
 
 impl CanonicalKey for String {
     fn to_canonical_bytes(&self) -> Vec<u8> { self.as_bytes().to_vec() }
+    fn from_canonical_bytes(bytes: &[u8]) -> Option<Self> { String::from_utf8(bytes.to_vec()).ok() }
 }
 
 /// The mock signature scheme used throughout the tests: a valid signature by `key` over `msg` is
@@ -723,5 +724,103 @@ mod encoding {
     fn tagged_hash_is_domain_separated() {
         // The same message under different tags yields different digests.
         assert_ne!(tagged_hash("dep17/operation", b"x"), tagged_hash("dep17/descriptor", b"x"));
+    }
+}
+
+mod codec {
+    use super::*;
+    use crate::calculus::encode::{decode_descriptor, encode_descriptor, DecodeError};
+
+    fn roundtrips(src: &str) {
+        let d = parse::<Pk>(src).unwrap();
+        let bytes = encode_descriptor(&d);
+        let back = decode_descriptor::<Pk>(&bytes).expect("decode");
+        assert_eq!(d, back);
+        // Encoding the decoded value reproduces the same bytes.
+        assert_eq!(bytes, encode_descriptor(&back));
+    }
+
+    #[test]
+    fn worked_examples_round_trip() {
+        roundtrips(ALLOWANCE);
+        roundtrips("prove(pk(K1))");
+        roundtrips(
+            "with(user = K1, guardians = [K3, K4, K5], in match(operation_type(), \
+             branch(spend, prove(pk(user))), branch(replace, prove(pk_threshold(2, guardians))), \
+             branch(else, false)))",
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let d = parse::<Pk>("prove(pk(K1))").unwrap();
+        let mut bytes = encode_descriptor(&d);
+        bytes.push(0x00);
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::TrailingBytes));
+    }
+
+    #[test]
+    fn truncated_input_is_rejected() {
+        let d = parse::<Pk>("prove(pk(K1))").unwrap();
+        let bytes = encode_descriptor(&d);
+        let truncated = &bytes[..bytes.len() - 1];
+        assert_eq!(decode_descriptor::<Pk>(truncated), Err(DecodeError::UnexpectedEof));
+    }
+
+    #[test]
+    fn bad_version_is_rejected() {
+        let d = parse::<Pk>("prove(pk(K1))").unwrap();
+        let mut bytes = encode_descriptor(&d);
+        bytes[0] = 0x02;
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::BadVersion(2)));
+    }
+
+    #[test]
+    fn unknown_node_tag_is_rejected() {
+        // version=1, 0 constants, then an out-of-range node tag (0xff).
+        let bytes = [0x01u8, 0, 0, 0, 0, 0xff];
+        match decode_descriptor::<Pk>(&bytes) {
+            Err(DecodeError::UnknownTag("node", 0xff)) => {}
+            other => panic!("expected unknown node tag, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_canonical_bool_is_rejected() {
+        // version=1, 0 constants, Const node (0x00) with a bool byte of 2.
+        let bytes = [0x01u8, 0, 0, 0, 0, 0x00, 0x02];
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::NonCanonicalBool(2)));
+    }
+
+    #[test]
+    fn unsorted_constants_are_rejected() {
+        // version=1, 2 constants in the wrong order ("b" before "a"), then body true.
+        // each constant: u32 name-len, name, value(int tag 0x00 + 16 bytes).
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        for name in ["b", "a"] {
+            bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0x00); // int value tag
+            bytes.extend_from_slice(&0i128.to_be_bytes());
+        }
+        bytes.push(0x00); // body: Const
+        bytes.push(0x01); // true
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::NonCanonicalOrder));
+    }
+
+    #[test]
+    fn invalid_constant_name_is_rejected() {
+        // A single constant named "Bad-Name" (uppercase + hyphen), value int 0, body true.
+        let name = "Bad-Name";
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0x00);
+        bytes.extend_from_slice(&0i128.to_be_bytes());
+        bytes.push(0x00);
+        bytes.push(0x01);
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::InvalidName));
     }
 }
