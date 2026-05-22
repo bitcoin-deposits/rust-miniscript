@@ -899,3 +899,124 @@ pub fn decode_descriptor<Pk: MiniscriptKey + CanonicalKey>(
     d.finish()?;
     Ok(Descriptor { constants, body })
 }
+
+// ----------------------------------------------------------------------------------------------
+// dep-17 state-snapshot encoding
+// ----------------------------------------------------------------------------------------------
+
+fn rwfield_id(field: &str) -> Option<u8> {
+    match field {
+        "amount_out" => Some(0),
+        "amount_in" => Some(1),
+        "transfer_count" => Some(2),
+        _ => None,
+    }
+}
+
+fn rwfield_name(id: u8) -> Result<&'static str, DecodeError> {
+    match id {
+        0 => Ok("amount_out"),
+        1 => Ok("amount_in"),
+        2 => Ok("transfer_count"),
+        _ => Err(DecodeError::UnknownTag("rwfield", id as u32)),
+    }
+}
+
+/// The dep-17 canonical byte encoding of a ledger snapshot.
+pub fn encode_snapshot(s: &super::snapshot::Snapshot) -> Vec<u8> {
+    let mut out = vec![0x01]; // version
+    put_int(&mut out, s.balance);
+    put_u32(&mut out, s.blocks_since_activity);
+    put_u32(&mut out, s.blocks_since_open);
+    put_u32(&mut out, s.height);
+
+    // Rolling windows, sorted by (field id, period). Entries with an unregistered field are
+    // dropped: they can never be read (no value function names them) and have no canonical id.
+    let mut rolling: Vec<(u8, u32, i128)> = s
+        .rolling
+        .iter()
+        .filter_map(|((field, period), amount)| rwfield_id(field).map(|id| (id, *period, *amount)))
+        .collect();
+    rolling.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    put_u32(&mut out, rolling.len() as u32);
+    for (field_id, period, amount) in &rolling {
+        out.push(*field_id);
+        put_u32(&mut out, *period);
+        put_int(&mut out, *amount);
+    }
+
+    // Cumulative spend, sorted by path (BTreeMap iterates in path order).
+    put_u32(&mut out, s.cumulative_spent.len() as u32);
+    for (path, amount) in &s.cumulative_spent {
+        put_u32(&mut out, path.len() as u32);
+        for i in path {
+            put_u32(&mut out, *i as u32);
+        }
+        put_int(&mut out, *amount);
+    }
+    out
+}
+
+/// The snapshot commitment: `tagged_hash("dep17/snapshot", encode_snapshot(s))`.
+pub fn snapshot_id(s: &super::snapshot::Snapshot) -> [u8; 32] {
+    tagged_hash("dep17/snapshot", &encode_snapshot(s))
+}
+
+/// Decode a snapshot from its dep-17 canonical encoding, rejecting non-canonical input.
+pub fn decode_snapshot(buf: &[u8]) -> Result<super::snapshot::Snapshot, DecodeError> {
+    let mut d = Decoder::new(buf);
+    let version = d.u8()?;
+    if version != 0x01 {
+        return Err(DecodeError::BadVersion(version));
+    }
+    let balance = d.int()?;
+    let blocks_since_activity = d.u32()?;
+    let blocks_since_open = d.u32()?;
+    let height = d.u32()?;
+
+    let mut rolling = BTreeMap::new();
+    let n = d.u32()?;
+    let mut prev: Option<(u8, u32)> = None;
+    for _ in 0..n {
+        let field_id = d.u8()?;
+        let period = d.u32()?;
+        let amount = d.int()?;
+        let key = (field_id, period);
+        if let Some(prev) = prev {
+            if key <= prev {
+                return Err(DecodeError::NonCanonicalOrder);
+            }
+        }
+        prev = Some(key);
+        rolling.insert((rwfield_name(field_id)?.to_string(), period), amount);
+    }
+
+    let mut cumulative_spent: BTreeMap<Vec<usize>, i128> = BTreeMap::new();
+    let m = d.u32()?;
+    let mut prev_path: Option<Vec<usize>> = None;
+    for _ in 0..m {
+        let plen = d.u32()?;
+        let mut path = Vec::with_capacity(plen as usize);
+        for _ in 0..plen {
+            path.push(d.u32()? as usize);
+        }
+        let amount = d.int()?;
+        if let Some(prev) = &prev_path {
+            if &path <= prev {
+                return Err(DecodeError::NonCanonicalOrder);
+            }
+        }
+        prev_path = Some(path.clone());
+        cumulative_spent.insert(path, amount);
+    }
+
+    d.finish()?;
+    Ok(super::snapshot::Snapshot {
+        balance,
+        blocks_since_activity,
+        blocks_since_open,
+        height,
+        rolling,
+        cumulative_spent,
+    })
+}

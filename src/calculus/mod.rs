@@ -35,6 +35,7 @@ pub mod schema;
 #[cfg(feature = "std")]
 pub mod secp;
 pub mod signature;
+pub mod snapshot;
 pub mod value;
 pub mod witness;
 
@@ -42,8 +43,8 @@ pub use self::admission::{admit, check_polarity, AdmissionError};
 pub use self::ast::{BTerm, Descriptor, Obligation, VTerm};
 pub use self::capability::{CapabilitySet, ObligationKind};
 pub use self::encode::{
-    decode_descriptor, descriptor_id, encode_descriptor, operation_preimage, operation_sighash,
-    tagged_hash, CanonicalKey, DecodeError,
+    decode_descriptor, decode_snapshot, descriptor_id, encode_descriptor, encode_snapshot,
+    operation_preimage, operation_sighash, snapshot_id, tagged_hash, CanonicalKey, DecodeError,
 };
 pub use self::eval::{eval_b, evaluate, Env, EvalError};
 pub use self::fraud::{replay, ReplayOutcome};
@@ -55,5 +56,6 @@ pub use self::schema::Schema;
 #[cfg(feature = "std")]
 pub use self::secp::EcdsaVerifier;
 pub use self::signature::{Signature, Verifier};
+pub use self::snapshot::Snapshot;
 pub use self::value::{HashValue, Value};
 pub use self::witness::Witness;

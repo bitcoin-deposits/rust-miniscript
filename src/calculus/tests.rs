@@ -868,3 +868,72 @@ mod hash_literals {
         assert!(parse::<Pk>("prove(hashlock(sha256:0xdead))").is_err());
     }
 }
+
+mod snapshot_codec {
+    use super::*;
+    use crate::calculus::encode::{decode_snapshot, encode_snapshot, snapshot_id};
+    use crate::calculus::snapshot::Snapshot;
+
+    fn sample() -> Snapshot {
+        let mut rolling = BTreeMap::new();
+        rolling.insert(("amount_out".to_string(), 4320u32), 250i128);
+        rolling.insert(("amount_in".to_string(), 4320u32), 90i128);
+        let mut cumulative_spent = BTreeMap::new();
+        cumulative_spent.insert(vec![0usize], 1000i128);
+        cumulative_spent.insert(vec![1usize, 2usize], 50i128);
+        Snapshot {
+            balance: 1_000_000,
+            blocks_since_activity: 12,
+            blocks_since_open: 9000,
+            height: 850_000,
+            rolling,
+            cumulative_spent,
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trips_and_commits_stably() {
+        let s = sample();
+        let bytes = encode_snapshot(&s);
+        assert_eq!(decode_snapshot(&bytes).unwrap(), s);
+        assert_eq!(snapshot_id(&s), snapshot_id(&s));
+        assert_ne!(snapshot_id(&s), snapshot_id(&Snapshot::default()));
+    }
+
+    #[test]
+    fn snapshot_drives_real_evaluation() {
+        // The allowance descriptor evaluated against a concrete Snapshot rather than the mock.
+        let d = parse::<Pk>(ALLOWANCE).unwrap();
+        let mut s = sample();
+        s.balance = 1000;
+        s.blocks_since_activity = 5000; // > 4320
+        // Delegate path: amount 100 = 10% of 1000, rolling amount_out below 30% (300).
+        s.rolling.clear();
+        s.rolling.insert(("amount_out".to_string(), 4320), 50);
+        let op = MockOp::spend(100, "anywhere");
+        let w = witness_signed_by(&op, &["K2"]);
+        assert!(evaluate(&d, &op, &s, &w, &MockVerifier).unwrap());
+    }
+
+    #[test]
+    fn unsorted_rolling_windows_are_rejected() {
+        // version, balance(0), 3x u32 zero, then 2 rolling entries out of (field_id,period) order.
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(&0i128.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // since_activity
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // since_open
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // height
+        bytes.extend_from_slice(&2u32.to_be_bytes()); // 2 rolling entries
+        // entry (field_id=1, period=0) then (field_id=0, period=0): decreasing -> rejected.
+        for field_id in [1u8, 0u8] {
+            bytes.push(field_id);
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.extend_from_slice(&0i128.to_be_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // 0 cumulative entries
+        assert_eq!(
+            decode_snapshot(&bytes),
+            Err(crate::calculus::encode::DecodeError::NonCanonicalOrder),
+        );
+    }
+}
