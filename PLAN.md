@@ -33,7 +33,7 @@ src/calculus/
   eval.rs       eval_b / eval_v / eval_state / verify_o
   admission.rs  polarity + capability checks
   modify.rs     insert/replace/delete -> T', re-admission
-  encode.rs     canonical encoding trait (dep-16 boundary; stub for now)
+  encode.rs     canonical encoding trait (stub for now)
   fraud.rs      replay
 ```
 
@@ -137,7 +137,7 @@ modification.
    the `pk_h` index, hashlocks.
 4. **AST ops + modification.** `ast_ref`/`subtree_at`/`operation_subtree`, `insert/replace/delete`
    producing `T'`, re-admission. Run the guardian-rotation example end-to-end.
-5. **Canonical encoding (dep-16) + fraud replay + determinism fixtures.**
+5. **Canonical encoding + fraud replay + determinism fixtures.**
 
 ## Testing
 
@@ -147,7 +147,7 @@ modification.
   evaluate under random `(w, s, m)`, then under `m' ⊇ m`, assert `accept(m) ⟹ accept(m')`. This
   is the single highest-value test — it exercises the polarity checker and evaluator against the
   one security claim.
-- Determinism golden vectors `(T, w, s, m) -> verdict`, shared across implementations once dep-16 lands.
+- Determinism golden vectors `(T, w, s, m) -> verdict`, shared across implementations once the canonical encodings are fixed.
 - Fuzz the parser and `eval` (reuse the `fuzz/` harness style).
 
 ## First step
