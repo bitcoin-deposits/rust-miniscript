@@ -1050,3 +1050,149 @@ mod fraud_bundle {
         assert!(FraudProof::<Pk>::decode(&bytes).is_err());
     }
 }
+
+// ----------------------------------------------------------------------------------------------
+// Wallet templates: worked descriptors for common policies.
+// ----------------------------------------------------------------------------------------------
+
+mod templates {
+    use super::*;
+    use crate::calculus::admission::admit;
+    use crate::calculus::capability::CapabilitySet;
+    use crate::calculus::modify::admit_modification;
+
+    // ----- spending rate limit -----------------------------------------------------------------
+    // A cold key spends without limit; a hot key spends only up to a per-operation cap and a
+    // rolling weekly cap (1008 blocks). The rolling cap reads `amount_out` over the window.
+    const RATE_LIMIT: &str = "
+        with(cold = K1, hot = K2, in match(operation_type(),
+          branch(spend, or(
+            prove(pk(cold)),
+            and(
+              prove(pk(hot)),
+              amount_at_most(100000),
+              rolling_amount_below(500000, 1008)
+            )
+          )),
+          branch(else, false)
+        ))";
+
+    #[test]
+    fn rate_limit_admits() {
+        assert!(admit(&parse::<Pk>(RATE_LIMIT).unwrap(), &CapabilitySet::everything()).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_behaves() {
+        // Cold key: any amount, regardless of rolling usage.
+        let big = MockOp::spend(1_000_000, "x");
+        assert!(decide(RATE_LIMIT, &big, &MockLedger::default(), &["K1"]));
+
+        // Hot key within both caps.
+        let ok = MockOp::spend(50_000, "x");
+        let st = MockLedger { rolling_out: 200_000, ..MockLedger::default() };
+        assert!(decide(RATE_LIMIT, &ok, &st, &["K2"]));
+
+        // Hot key over the per-operation cap.
+        let over = MockOp::spend(150_000, "x");
+        assert!(!decide(RATE_LIMIT, &over, &MockLedger::default(), &["K2"]));
+
+        // Hot key within the per-op cap but over the rolling cap.
+        let st_hot = MockLedger { rolling_out: 600_000, ..MockLedger::default() };
+        assert!(!decide(RATE_LIMIT, &ok, &st_hot, &["K2"]));
+    }
+
+    // ----- inheritance -------------------------------------------------------------------------
+    // The owner spends anytime; the heir can spend only after a long period of inactivity
+    // (52560 blocks ~ 1 year), which resets on every authorized operation.
+    const INHERITANCE: &str = "
+        with(owner = K1, heir = K2, in match(operation_type(),
+          branch(spend, or(
+            prove(pk(owner)),
+            and(prove(pk(heir)), blocks_since_activity_at_least(52560))
+          )),
+          branch(else, false)
+        ))";
+
+    #[test]
+    fn inheritance_behaves() {
+        let op = MockOp::spend(100, "x");
+        // Owner spends regardless of activity.
+        assert!(decide(INHERITANCE, &op, &MockLedger::default(), &["K1"]));
+        // Heir blocked while the owner is recently active.
+        let recent = MockLedger { since_activity: 1000, ..MockLedger::default() };
+        assert!(!decide(INHERITANCE, &op, &recent, &["K2"]));
+        // Heir spends after the inactivity window.
+        let stale = MockLedger { since_activity: 60_000, ..MockLedger::default() };
+        assert!(decide(INHERITANCE, &op, &stale, &["K2"]));
+    }
+
+    // ----- social recovery ---------------------------------------------------------------------
+    // The owner spends and modifies freely. A 2-of-3 guardian quorum may, after 30 days of
+    // inactivity, replace the owner's spend clause (the subterm at path [0]) — installing a new
+    // key. Authority can expand here (a guardian quorum restores access), which capability
+    // narrowing cannot express.
+    const SOCIAL_RECOVERY: &str = "
+        with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
+          branch(spend, prove(pk(owner))),
+          branch(replace, or(
+            prove(pk(owner)),
+            and(
+              prove(pk_threshold(2, guardians)),
+              blocks_since_activity_at_least(4320),
+              cmp(=, operation_path(), path(0))
+            )
+          )),
+          branch(else, false)
+        ))";
+
+    fn clause(src: &str) -> super::super::ast::BTerm<Pk> { parse::<Pk>(src).unwrap().body }
+
+    #[test]
+    fn social_recovery_authorizes_and_applies() {
+        let new_owner = clause("prove(pk(K9))");
+        let op = MockOp::replace(vec![0], new_owner.clone());
+        let stale = MockLedger { since_activity: 5000, ..MockLedger::default() };
+
+        // Quorum is authorized to replace the owner clause after inactivity.
+        assert!(decide(SOCIAL_RECOVERY, &op, &stale, &["G1", "G2"]));
+        // Owner can replace anytime.
+        assert!(decide(SOCIAL_RECOVERY, &op, &MockLedger::default(), &["K1"]));
+        // One guardian, or before the window, is not enough.
+        assert!(!decide(SOCIAL_RECOVERY, &op, &stale, &["G1"]));
+        let fresh = MockLedger { since_activity: 10, ..MockLedger::default() };
+        assert!(!decide(SOCIAL_RECOVERY, &op, &fresh, &["G1", "G2"]));
+
+        // The modification produces a well-formed descriptor with the owner clause replaced.
+        let d = parse::<Pk>(SOCIAL_RECOVERY).unwrap();
+        let updated = admit_modification(&d, &op, &CapabilitySet::everything()).expect("admitted");
+        assert_eq!(updated.body.subterm_at(&[0]), Some(&new_owner));
+    }
+
+    // ----- Liana (decaying multisig) -----------------------------------------------------------
+    // The primary path is a 2-of-2; a recovery key becomes spendable only after a relative
+    // timelock. This is the Liana wallet shape: normal multisig now, single-key recovery later.
+    const LIANA: &str = "
+        with(primary_a = K1, primary_b = K2, recovery = K3, in match(operation_type(),
+          branch(spend, or(
+            and(prove(pk(primary_a)), prove(pk(primary_b))),
+            and(prove(pk(recovery)), older(65535))
+          )),
+          branch(else, false)
+        ))";
+
+    #[test]
+    fn liana_behaves() {
+        let op = MockOp::spend(100, "x");
+        // 2-of-2 primary spends anytime.
+        assert!(decide(LIANA, &op, &MockLedger::default(), &["K1", "K2"]));
+        // A single primary key is insufficient.
+        assert!(!decide(LIANA, &op, &MockLedger::default(), &["K1"]));
+        // Recovery is blocked before the timelock matures (older reads blocks-since-open).
+        let young = MockLedger { since_open: 1000, ..MockLedger::default() };
+        assert!(!decide(LIANA, &op, &young, &["K3"]));
+        // Recovery spends once the timelock has elapsed.
+        let mature = MockLedger { since_open: 70_000, ..MockLedger::default() };
+        assert!(decide(LIANA, &op, &mature, &["K3"]));
+    }
+}
