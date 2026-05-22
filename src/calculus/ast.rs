@@ -78,6 +78,70 @@ pub enum Obligation<Pk: MiniscriptKey> {
     Attest(VTerm<Pk>, Schema),
 }
 
+impl<Pk: MiniscriptKey> BTerm<Pk> {
+    /// The head constructor of this term, as a symbol (`and`, `or`, `pk`, ...). For `state` and
+    /// `prove`, the predicate or obligation name; for `cmp`, `"cmp"`; for constants, `"true"` /
+    /// `"false"`.
+    pub fn shape(&self) -> &'static str {
+        match self {
+            BTerm::Const(true) => "true",
+            BTerm::Const(false) => "false",
+            BTerm::And(_) => "and",
+            BTerm::Or(_) => "or",
+            BTerm::Thresh(_, _) => "thresh",
+            BTerm::Not(_) => "not",
+            BTerm::If(_, _, _) => "if",
+            BTerm::Match { .. } => "match",
+            BTerm::Cmp(_, _, _) => "cmp",
+            BTerm::State(p, _) => p.name(),
+            BTerm::Prove(o) => o.shape(),
+        }
+    }
+
+    /// The `B`-sorted children of this term, in path-index order. Value-sorted children (the
+    /// `match` scrutinee, `cmp`/`state` arguments) are not addressable by path.
+    pub fn children(&self) -> Vec<&BTerm<Pk>> {
+        match self {
+            BTerm::Const(_) | BTerm::Cmp(_, _, _) | BTerm::State(_, _) | BTerm::Prove(_) => vec![],
+            BTerm::And(bs) | BTerm::Or(bs) | BTerm::Thresh(_, bs) => bs.iter().collect(),
+            BTerm::Not(b) => vec![b],
+            BTerm::If(c, t, e) => vec![c, t, e],
+            BTerm::Match { arms, default, .. } => {
+                let mut v: Vec<&BTerm<Pk>> = arms.iter().map(|(_, b)| b).collect();
+                v.push(default);
+                v
+            }
+        }
+    }
+
+    /// The subterm at `path`, navigating by child index. `[]` is this term.
+    pub fn subterm_at(&self, path: &[usize]) -> Option<&BTerm<Pk>> {
+        match path.split_first() {
+            None => Some(self),
+            Some((i, rest)) => self.children().get(*i).and_then(|c| c.subterm_at(rest)),
+        }
+    }
+
+    /// The depth of this term's ast (a leaf has depth 1).
+    pub fn depth(&self) -> usize {
+        1 + self.children().iter().map(|c| c.depth()).max().unwrap_or(0)
+    }
+}
+
+impl<Pk: MiniscriptKey> Obligation<Pk> {
+    /// The head constructor name of this obligation.
+    pub fn shape(&self) -> &'static str {
+        match self {
+            Obligation::Pk(_) => "pk",
+            Obligation::PkH(_) => "pk_h",
+            Obligation::PkAny(_) => "pk_any",
+            Obligation::PkThreshold(_, _) => "pk_threshold",
+            Obligation::Hashlock(_) => "hashlock",
+            Obligation::Attest(_, _) => "attest",
+        }
+    }
+}
+
 /// A complete descriptor: a `with(...)` constant environment together with a body of sort `B`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Descriptor<Pk: MiniscriptKey> {

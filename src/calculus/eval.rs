@@ -3,21 +3,21 @@
 //! The evaluator.
 //!
 //! Evaluation is a strict, total, structural fold of `(T, w, s, m)` to a verdict. The
-//! m-constancy invariant is reflected in the signatures: [`eval_v`] and [`eval_state`] do not
-//! receive the witness and cannot depend on it; [`verify_o`] is the sole entry point for witness
-//! data.
+//! m-constancy invariant is reflected in the signatures: [`eval_v`] and [`eval_state`] receive the
+//! operation, ledger state, and the descriptor root (all constant in the witness) but never the
+//! witness; [`verify_o`] is the sole entry point for witness data.
 //!
 //! `eval_*` returns a `Result`. The error cases ([`EvalError`]) are exactly the well-formedness
-//! violations that admission rules out — an unresolved constant, a sort/type mismatch, an
-//! unsupported primitive. After a descriptor passes admission these cannot occur, so post-admission
-//! evaluation is total.
+//! violations that admission rules out — an unresolved constant, a sort/type mismatch, a path out
+//! of range, an unsupported primitive. After a descriptor passes admission these cannot occur, so
+//! post-admission evaluation is total.
 
 use crate::prelude::*;
 use crate::MiniscriptKey;
 
-use super::ast::{BTerm, Obligation, VTerm};
+use super::ast::{BTerm, Descriptor, Obligation, VTerm};
 use super::host::{LedgerState, Operation};
-use super::registry::{CmpOp, StatePred, ValueFn};
+use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
 use super::signature::Verifier;
 use super::value::{bps, floor_div, pct, sat_add, sat_mul, sat_sub, HashValue, Value};
 use super::witness::Witness;
@@ -33,18 +33,43 @@ pub enum EvalError {
     UnresolvedVar(String),
     /// A value had the wrong type for the position it was used in.
     TypeMismatch(&'static str),
-    /// A primitive not yet implemented in this phase.
+    /// An ast path referenced a position that does not exist.
+    PathOutOfRange,
+    /// A primitive not implemented.
     Unsupported(&'static str),
+}
+
+/// Evaluate a complete descriptor against an operation, ledger state, witness, and verifier.
+///
+/// This is the top-level entry point; the descriptor's body is the term and its own root for ast
+/// inspection.
+pub fn evaluate<Pk, O, L, V>(
+    d: &Descriptor<Pk>,
+    op: &O,
+    st: &L,
+    w: &Witness<Pk>,
+    verifier: &V,
+) -> Result<bool, EvalError>
+where
+    Pk: MiniscriptKey,
+    O: Operation<Pk>,
+    L: LedgerState,
+    V: Verifier<Pk>,
+{
+    eval_b(&d.body, &d.constants, &d.body, op, st, w, verifier)
 }
 
 /// Evaluate a boolean term to a verdict.
 ///
 /// `w` and `verifier` are the only witness-dependent inputs; they reach the leaves solely through
 /// [`verify_o`]. [`eval_v`] and [`eval_state`] do not receive them, so values and state predicates
-/// are constant in the witness by construction.
+/// are constant in the witness by construction. `root` is the descriptor's own body, used by ast
+/// inspection; it is constant in the witness.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_b<Pk, O, L, V>(
     t: &BTerm<Pk>,
     env: &Env<Pk>,
+    root: &BTerm<Pk>,
     op: &O,
     st: &L,
     w: &Witness<Pk>,
@@ -60,7 +85,7 @@ where
         BTerm::Const(b) => Ok(*b),
         BTerm::And(bs) => {
             for b in bs {
-                if !eval_b(b, env, op, st, w, verifier)? {
+                if !eval_b(b, env, root, op, st, w, verifier)? {
                     return Ok(false);
                 }
             }
@@ -68,7 +93,7 @@ where
         }
         BTerm::Or(bs) => {
             for b in bs {
-                if eval_b(b, env, op, st, w, verifier)? {
+                if eval_b(b, env, root, op, st, w, verifier)? {
                     return Ok(true);
                 }
             }
@@ -77,48 +102,54 @@ where
         BTerm::Thresh(k, bs) => {
             let mut count = 0;
             for b in bs {
-                if eval_b(b, env, op, st, w, verifier)? {
+                if eval_b(b, env, root, op, st, w, verifier)? {
                     count += 1;
                 }
             }
             Ok(count >= *k)
         }
-        BTerm::Not(b) => Ok(!eval_b(b, env, op, st, w, verifier)?),
+        BTerm::Not(b) => Ok(!eval_b(b, env, root, op, st, w, verifier)?),
         BTerm::If(c, then_, els) => {
-            if eval_b(c, env, op, st, w, verifier)? {
-                eval_b(then_, env, op, st, w, verifier)
+            if eval_b(c, env, root, op, st, w, verifier)? {
+                eval_b(then_, env, root, op, st, w, verifier)
             } else {
-                eval_b(els, env, op, st, w, verifier)
+                eval_b(els, env, root, op, st, w, verifier)
             }
         }
         BTerm::Match { scrutinee, arms, default } => {
-            let key = eval_v(scrutinee, env, op, st)?;
+            let key = eval_v(scrutinee, env, root, op, st)?;
             let sym = key.as_symbol().ok_or(EvalError::TypeMismatch("match scrutinee not a symbol"))?;
             for (tag, body) in arms {
                 if tag == sym {
-                    return eval_b(body, env, op, st, w, verifier);
+                    return eval_b(body, env, root, op, st, w, verifier);
                 }
             }
-            eval_b(default, env, op, st, w, verifier)
+            eval_b(default, env, root, op, st, w, verifier)
         }
         BTerm::Cmp(o, a, b) => {
-            let av = eval_v(a, env, op, st)?;
-            let bv = eval_v(b, env, op, st)?;
+            let av = eval_v(a, env, root, op, st)?;
+            let bv = eval_v(b, env, root, op, st)?;
             eval_cmp(*o, &av, &bv)
         }
         BTerm::State(p, args) => {
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
-                vals.push(eval_v(a, env, op, st)?);
+                vals.push(eval_v(a, env, root, op, st)?);
             }
-            eval_state(*p, &vals, op, st)
+            eval_state(*p, &vals, root, op, st)
         }
-        BTerm::Prove(o) => verify_o(o, env, w, verifier, op, st),
+        BTerm::Prove(o) => verify_o(o, env, root, w, verifier, op, st),
     }
 }
 
 /// Evaluate a value term. Does not receive the witness: values are constant in `m`.
-pub fn eval_v<Pk, O, L>(t: &VTerm<Pk>, env: &Env<Pk>, op: &O, st: &L) -> Result<Value<Pk>, EvalError>
+pub fn eval_v<Pk, O, L>(
+    t: &VTerm<Pk>,
+    env: &Env<Pk>,
+    root: &BTerm<Pk>,
+    op: &O,
+    st: &L,
+) -> Result<Value<Pk>, EvalError>
 where
     Pk: MiniscriptKey,
     O: Operation<Pk>,
@@ -127,7 +158,7 @@ where
     match t {
         VTerm::Lit(v) => Ok(v.clone()),
         VTerm::Var(name) => env.get(name).cloned().ok_or_else(|| EvalError::UnresolvedVar(name.clone())),
-        VTerm::Op(f, args) => eval_valuefn(*f, args, env, op, st),
+        VTerm::Op(f, args) => eval_valuefn(*f, args, env, root, op, st),
     }
 }
 
@@ -135,6 +166,7 @@ fn eval_valuefn<Pk, O, L>(
     f: ValueFn,
     args: &[VTerm<Pk>],
     env: &Env<Pk>,
+    root: &BTerm<Pk>,
     op: &O,
     st: &L,
 ) -> Result<Value<Pk>, EvalError>
@@ -144,7 +176,13 @@ where
     L: LedgerState,
 {
     let int_arg = |i: usize| -> Result<i128, EvalError> {
-        eval_v(&args[i], env, op, st)?.as_int().ok_or(EvalError::TypeMismatch("expected integer"))
+        eval_v(&args[i], env, root, op, st)?.as_int().ok_or(EvalError::TypeMismatch("expected integer"))
+    };
+    let path_arg = |i: usize| -> Result<Vec<usize>, EvalError> {
+        match eval_v(&args[i], env, root, op, st)? {
+            Value::Path(p) => Ok(p),
+            _ => Err(EvalError::TypeMismatch("expected a path")),
+        }
     };
     match f {
         ValueFn::Add => Ok(Value::Int(sat_add(int_arg(0)?, int_arg(1)?))),
@@ -157,7 +195,7 @@ where
         ValueFn::Bps => Ok(Value::Int(bps(int_arg(0)?, int_arg(1)?))),
         ValueFn::OperationType => Ok(Value::Symbol(op.op_type())),
         ValueFn::OperationArg => {
-            let name = eval_v(&args[0], env, op, st)?;
+            let name = eval_v(&args[0], env, root, op, st)?;
             let name = name.as_symbol().ok_or(EvalError::TypeMismatch("operation_arg name not a symbol"))?;
             op.arg(name.as_str()).ok_or(EvalError::TypeMismatch("operation lacks this argument"))
         }
@@ -172,27 +210,35 @@ where
         ValueFn::BlocksSinceOpen => Ok(Value::Int(st.blocks_since_open())),
         ValueFn::DepositBalance => Ok(Value::Int(st.balance())),
         ValueFn::RollingWindow => {
-            let field = eval_v(&args[0], env, op, st)?;
+            let field = eval_v(&args[0], env, root, op, st)?;
             let field = field.as_symbol().ok_or(EvalError::TypeMismatch("rolling_window field not a symbol"))?;
             let period = int_arg(1)?;
             Ok(Value::Int(st.rolling_window(field.as_str(), period)))
         }
         ValueFn::CumulativeSpentVia => {
-            let p = eval_v(&args[0], env, op, st)?;
-            match p {
-                Value::Path(p) => Ok(Value::Int(st.cumulative_spent_via(&p))),
-                _ => Err(EvalError::TypeMismatch("cumulative_spent_via expects a path")),
-            }
+            let p = path_arg(0)?;
+            Ok(Value::Int(st.cumulative_spent_via(&p)))
         }
         ValueFn::Path => {
             let mut idx = Vec::with_capacity(args.len());
             for a in args {
-                let n = eval_v(a, env, op, st)?.as_int().ok_or(EvalError::TypeMismatch("path index not an integer"))?;
+                let n = eval_v(a, env, root, op, st)?.as_int().ok_or(EvalError::TypeMismatch("path index not an integer"))?;
                 idx.push(n as usize);
             }
             Ok(Value::Path(idx))
         }
-        ValueFn::AstRef | ValueFn::AstShapeAt => Err(EvalError::Unsupported("ast inspection (phase 4)")),
+        ValueFn::AstRef => {
+            let p = path_arg(0)?;
+            root.subterm_at(&p)
+                .map(|s| Value::Subtree(Box::new(s.clone())))
+                .ok_or(EvalError::PathOutOfRange)
+        }
+        ValueFn::AstShapeAt => {
+            let p = path_arg(0)?;
+            root.subterm_at(&p)
+                .map(|s| Value::Symbol(Symbol::new(s.shape())))
+                .ok_or(EvalError::PathOutOfRange)
+        }
     }
 }
 
@@ -200,6 +246,7 @@ where
 pub fn eval_state<Pk, O, L>(
     p: StatePred,
     args: &[Value<Pk>],
+    root: &BTerm<Pk>,
     op: &O,
     st: &L,
 ) -> Result<bool, EvalError>
@@ -239,7 +286,18 @@ where
         StatePred::RollingAmountBelowPct => {
             Ok(st.rolling_window("amount_out", arg_int(1)?) <= pct(st.balance(), arg_int(0)?))
         }
-        StatePred::SubtreeAt => Err(EvalError::Unsupported("subtree_at (phase 4)")),
+        StatePred::SubtreeAt => {
+            // subtree_at(candidate, path): is `candidate` structurally the subtree at `path`?
+            let p = match &args[1] {
+                Value::Path(p) => p,
+                _ => return Err(EvalError::TypeMismatch("subtree_at expects a path")),
+            };
+            match (root.subterm_at(p), &args[0]) {
+                (Some(found), Value::Subtree(cand)) => Ok(**cand == *found),
+                (None, _) => Ok(false),
+                (Some(_), _) => Err(EvalError::TypeMismatch("subtree_at candidate is not a subtree")),
+            }
+        }
     }
 }
 
@@ -263,9 +321,11 @@ fn eval_cmp<Pk: MiniscriptKey>(o: CmpOp, a: &Value<Pk>, b: &Value<Pk>) -> Result
 }
 
 /// Discharge a proof obligation against the witness. The only witness-dependent evaluation.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_o<Pk, O, L, V>(
     o: &Obligation<Pk>,
     env: &Env<Pk>,
+    root: &BTerm<Pk>,
     w: &Witness<Pk>,
     verifier: &V,
     op: &O,
@@ -278,13 +338,13 @@ where
     V: Verifier<Pk>,
 {
     let as_key = |v: &VTerm<Pk>| -> Result<Pk, EvalError> {
-        match eval_v(v, env, op, st)? {
+        match eval_v(v, env, root, op, st)? {
             Value::Key(k) => Ok(k),
             _ => Err(EvalError::TypeMismatch("expected a key")),
         }
     };
     let as_keys = |v: &VTerm<Pk>| -> Result<Vec<Pk>, EvalError> {
-        match eval_v(v, env, op, st)? {
+        match eval_v(v, env, root, op, st)? {
             Value::List(items) => items
                 .into_iter()
                 .map(|v| match v {
@@ -313,18 +373,17 @@ where
             Ok(keys.iter().filter(|k| signed_by(k)).count() >= *k)
         }
         Obligation::PkH(v) => {
-            let keyhash = match eval_v(v, env, op, st)? {
+            let keyhash = match eval_v(v, env, root, op, st)? {
                 Value::Hash(h) => h,
                 _ => return Err(EvalError::TypeMismatch("pk_h expects a key hash")),
             };
-            // Find a witnessed key that hashes to `keyhash` and whose signature verifies.
             let msg = op.signing_message();
             Ok(w.signatures.iter().any(|(k, sig)| {
                 verifier.key_hashes_to(k, &keyhash) && verifier.verify_signature(k, sig, &msg)
             }))
         }
         Obligation::Hashlock(v) => {
-            let h = match eval_v(v, env, op, st)? {
+            let h = match eval_v(v, env, root, op, st)? {
                 Value::Hash(h) => h,
                 _ => return Err(EvalError::TypeMismatch("hashlock expects a hash")),
             };

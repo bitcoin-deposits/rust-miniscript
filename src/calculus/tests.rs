@@ -4,7 +4,7 @@
 
 use crate::prelude::*;
 
-use super::eval::eval_b;
+use super::eval::{eval_b, evaluate};
 use super::host::{LedgerState, Operation};
 use super::parse::parse;
 use super::registry::Symbol;
@@ -50,10 +50,12 @@ fn witness_signed_by(op: &MockOp, signers: &[&str]) -> Witness<Pk> {
     w
 }
 
-/// A mock operation: a type tag and a bag of named arguments.
+/// A mock operation: a type tag, named arguments, and optional modification path/subtree.
 struct MockOp {
     ty: &'static str,
     args: BTreeMap<String, Value<Pk>>,
+    path: Option<Vec<usize>>,
+    subtree: Option<super::ast::BTerm<Pk>>,
 }
 
 impl MockOp {
@@ -61,16 +63,21 @@ impl MockOp {
         let mut args = BTreeMap::new();
         args.insert("amount".to_string(), Value::Int(amount));
         args.insert("destination".to_string(), Value::Key(destination.to_string()));
-        MockOp { ty: "spend", args }
+        MockOp { ty: "spend", args, path: None, subtree: None }
     }
-    fn of_type(ty: &'static str) -> Self { MockOp { ty, args: BTreeMap::new() } }
+    fn of_type(ty: &'static str) -> Self {
+        MockOp { ty, args: BTreeMap::new(), path: None, subtree: None }
+    }
+    fn replace(path: Vec<usize>, subtree: super::ast::BTerm<Pk>) -> Self {
+        MockOp { ty: "replace", args: BTreeMap::new(), path: Some(path), subtree: Some(subtree) }
+    }
 }
 
 impl Operation<Pk> for MockOp {
     fn op_type(&self) -> Symbol { Symbol::new(self.ty) }
     fn arg(&self, name: &str) -> Option<Value<Pk>> { self.args.get(name).cloned() }
-    fn path(&self) -> Option<Vec<usize>> { None }
-    fn subtree(&self) -> Option<super::ast::BTerm<Pk>> { None }
+    fn path(&self) -> Option<Vec<usize>> { self.path.clone() }
+    fn subtree(&self) -> Option<super::ast::BTerm<Pk>> { self.subtree.clone() }
     fn signing_message(&self) -> Vec<u8> {
         // A deterministic encoding binding the operation type and its arguments. The real
         // canonical encoding is specified elsewhere; this suffices to bind signatures in tests.
@@ -140,7 +147,7 @@ const ALLOWANCE: &str = "
 fn decide(src: &str, op: &MockOp, st: &MockLedger, signers: &[&str]) -> bool {
     let d = parse::<Pk>(src).expect("parse");
     let w = witness_signed_by(op, signers);
-    eval_b(&d.body, &d.constants, op, st, &w, &MockVerifier).expect("eval")
+    evaluate(&d, op, st, &w, &MockVerifier).expect("eval")
 }
 
 #[test]
@@ -367,7 +374,7 @@ mod monotonicity {
         let signers: Vec<&str> = (0..4).filter(|i| mask & (1 << i) != 0).map(|i| KEYS[i]).collect();
         let w = super::witness_signed_by(&op, &signers);
         let env = BTreeMap::new();
-        eval_b(term, &env, &op, &st, &w, &super::MockVerifier).expect("generated terms never error")
+        eval_b(term, &env, term, &op, &st, &w, &super::MockVerifier).expect("generated terms never error")
     }
 
     #[test]
@@ -430,9 +437,9 @@ mod proofs {
         let w = witness_signed_by(&op_a, &["K1"]);
 
         // It authorizes the operation it was signed for...
-        assert!(eval_b(&d.body, &d.constants, &op_a, &st, &w, &MockVerifier).unwrap());
+        assert!(evaluate(&d, &op_a, &st, &w, &MockVerifier).unwrap());
         // ...but not a different operation, even with the same key present.
-        assert!(!eval_b(&d.body, &d.constants, &op_b, &st, &w, &MockVerifier).unwrap());
+        assert!(!evaluate(&d, &op_b, &st, &w, &MockVerifier).unwrap());
     }
 
     #[test]
@@ -447,15 +454,15 @@ mod proofs {
 
         // No preimage: rejected.
         let empty = Witness::empty();
-        assert!(!eval_b(&d.body, &d.constants, &op, &st, &empty, &MockVerifier).unwrap());
+        assert!(!evaluate(&d, &op, &st, &empty, &MockVerifier).unwrap());
 
         // Correct preimage revealed: accepted.
         let w = Witness::empty().with_preimage(digest.clone(), preimage);
-        assert!(eval_b(&d.body, &d.constants, &op, &st, &w, &MockVerifier).unwrap());
+        assert!(evaluate(&d, &op, &st, &w, &MockVerifier).unwrap());
 
         // Wrong preimage under the same hash key: rejected (re-hash check fails).
         let w_bad = Witness::empty().with_preimage(digest, b"wrong".to_vec());
-        assert!(!eval_b(&d.body, &d.constants, &op, &st, &w_bad, &MockVerifier).unwrap());
+        assert!(!evaluate(&d, &op, &st, &w_bad, &MockVerifier).unwrap());
     }
 
     #[test]
@@ -470,10 +477,191 @@ mod proofs {
 
         // A signature by the key whose hash matches: accepted.
         let w = witness_signed_by(&op, &[key]);
-        assert!(eval_b(&d.body, &d.constants, &op, &st, &w, &MockVerifier).unwrap());
+        assert!(evaluate(&d, &op, &st, &w, &MockVerifier).unwrap());
 
         // A signature by a different key: rejected.
         let w_other = witness_signed_by(&op, &["K2"]);
-        assert!(!eval_b(&d.body, &d.constants, &op, &st, &w_other, &MockVerifier).unwrap());
+        assert!(!evaluate(&d, &op, &st, &w_other, &MockVerifier).unwrap());
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Phase 4: ast inspection + modification + re-admission
+// ----------------------------------------------------------------------------------------------
+
+mod modification {
+    use super::*;
+    use crate::calculus::admission::AdmissionError;
+    use crate::calculus::ast::{BTerm, Descriptor, Obligation, VTerm};
+    use crate::calculus::capability::CapabilitySet;
+    use crate::calculus::modify::{admit_modification, candidate, ModificationRejected};
+    use crate::calculus::registry::{StatePred, ValueFn};
+
+    const ROTATION: &str = "
+        with(
+          user = K1,
+          guardians = [G1, G2, G3, G4],
+          in match(operation_type(),
+            branch(spend, prove(pk(user))),
+            branch(replace,
+              or(
+                prove(pk(user)),
+                and(
+                  prove(pk_threshold(3, guardians)),
+                  blocks_since_activity_at_least(8640),
+                  cmp(=, operation_path(), path(0))
+                )
+              )
+            ),
+            branch(else, false)
+          )
+        )";
+
+    fn pk(k: &str) -> BTerm<Pk> {
+        BTerm::Prove(Obligation::Pk(VTerm::Lit(Value::Key(k.to_string()))))
+    }
+
+    #[test]
+    fn guardian_rotation_authorizes_replace_at_the_user_clause() {
+        let new_clause = pk("K9"); // the replacement subtree
+        let op = MockOp::replace(vec![0], new_clause);
+        let st = MockLedger { since_activity: 9000, ..MockLedger::default() }; // > 8640
+        // 3-of-4 guardians, replacing the subtree at path [0], after inactivity: authorized.
+        assert!(decide(ROTATION, &op, &st, &["G1", "G2", "G3"]));
+    }
+
+    #[test]
+    fn guardian_rotation_blocked_at_a_different_path() {
+        let op = MockOp::replace(vec![1], pk("K9")); // not the user clause
+        let st = MockLedger { since_activity: 9000, ..MockLedger::default() };
+        assert!(!decide(ROTATION, &op, &st, &["G1", "G2", "G3"]));
+    }
+
+    #[test]
+    fn guardian_rotation_blocked_before_inactivity() {
+        let op = MockOp::replace(vec![0], pk("K9"));
+        let st = MockLedger { since_activity: 10, ..MockLedger::default() };
+        assert!(!decide(ROTATION, &op, &st, &["G1", "G2", "G3"]));
+    }
+
+    // A self-modifying descriptor: the user may replace any subtree.
+    fn user_can_replace() -> Descriptor<Pk> {
+        let mut constants = BTreeMap::new();
+        constants.insert("user".to_string(), Value::Key("K1".to_string()));
+        let body = BTerm::Match {
+            scrutinee: VTerm::Op(ValueFn::OperationType, vec![]),
+            arms: vec![(
+                crate::calculus::registry::Symbol::new("replace"),
+                BTerm::Prove(Obligation::Pk(VTerm::Var("user".to_string()))),
+            )],
+            default: Box::new(BTerm::Const(false)),
+        };
+        Descriptor { constants, body }
+    }
+
+    #[test]
+    fn candidate_replaces_the_targeted_subtree() {
+        let d = user_can_replace();
+        // Replace the replace-branch body (path [0]) with a new well-formed clause.
+        let op = MockOp::replace(vec![0], pk("K2"));
+        let cand = candidate(&d, &op).expect("candidate");
+        // The targeted subterm is now pk(K2).
+        assert_eq!(cand.body.subterm_at(&[0]), Some(&pk("K2")));
+        // The new descriptor is admissible.
+        assert!(admit_modification(&d, &op, &CapabilitySet::everything()).is_ok());
+    }
+
+    #[test]
+    fn modification_introducing_a_negative_proof_is_rejected() {
+        let d = user_can_replace();
+        // Attempt to install `not(prove(pk(K2)))` — a negative-position proof obligation.
+        let bad = BTerm::Not(Box::new(pk("K2")));
+        let op = MockOp::replace(vec![0], bad);
+        // The candidate is constructible, but admission rejects it: the modification fails and the
+        // deposit keeps its current descriptor.
+        match admit_modification(&d, &op, &CapabilitySet::everything()) {
+            Err(ModificationRejected::Inadmissible(AdmissionError::NegativeProof)) => {}
+            other => panic!("expected NegativeProof rejection, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ast_inspection_reads_shape_and_subtree() {
+        // root = and( prove(pk(K1)), cmp(=, ast_shape_at(path(0)), <symbol "pk">) )
+        // child [0] is prove(pk(K1)), whose shape is "pk", so the comparison holds.
+        let leaf = pk("K1");
+        let shape_check = BTerm::Cmp(
+            crate::calculus::registry::CmpOp::Eq,
+            VTerm::Op(ValueFn::AstShapeAt, vec![VTerm::Op(ValueFn::Path, vec![VTerm::Lit(Value::Int(0))])]),
+            VTerm::Lit(Value::Symbol(crate::calculus::registry::Symbol::new("pk"))),
+        );
+        let subtree_check = BTerm::State(
+            StatePred::SubtreeAt,
+            vec![
+                VTerm::Lit(Value::Subtree(Box::new(leaf.clone()))),
+                VTerm::Op(ValueFn::Path, vec![VTerm::Lit(Value::Int(0))]),
+            ],
+        );
+        let body = BTerm::And(vec![leaf, shape_check, subtree_check]);
+        let d = Descriptor { constants: BTreeMap::new(), body };
+        let op = MockOp::spend(1, "x");
+        let st = MockLedger::default();
+        let w = witness_signed_by(&op, &["K1"]);
+        // pk(K1) signed, shape at [0] is "pk", subtree at [0] equals the leaf: all hold.
+        assert!(evaluate(&d, &op, &st, &w, &MockVerifier).unwrap());
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Phase 5: fraud replay + canonical encoding / determinism
+// ----------------------------------------------------------------------------------------------
+
+mod fraud_and_encoding {
+    use super::*;
+    use crate::calculus::encode::to_string;
+    use crate::calculus::fraud::{replay, ReplayOutcome};
+
+    #[test]
+    fn replay_confirms_a_correct_verdict_and_catches_a_wrong_one() {
+        let d = parse::<Pk>(ALLOWANCE).unwrap();
+        let op = MockOp::spend(999, "anywhere");
+        let st = MockLedger::default();
+        let w = witness_signed_by(&op, &["K1"]); // user signs; true verdict is accept
+
+        // The operator correctly claims accept.
+        assert_eq!(
+            replay(&d, &op, &st, &w, &MockVerifier, true).unwrap(),
+            ReplayOutcome::Consistent,
+        );
+        // The operator wrongly claims reject: a provable fault.
+        assert_eq!(
+            replay(&d, &op, &st, &w, &MockVerifier, false).unwrap(),
+            ReplayOutcome::OperatorFault { computed: true, claimed: false },
+        );
+    }
+
+    #[test]
+    fn replay_catches_an_unauthorized_acceptance() {
+        let d = parse::<Pk>(ALLOWANCE).unwrap();
+        let op = MockOp::spend(999, "anywhere");
+        let st = MockLedger::default();
+        let w = Witness::empty(); // nobody signed: true verdict is reject
+
+        // The operator claims accept on an unsigned operation: fault.
+        assert_eq!(
+            replay(&d, &op, &st, &w, &MockVerifier, true).unwrap(),
+            ReplayOutcome::OperatorFault { computed: false, claimed: true },
+        );
+    }
+
+    #[test]
+    fn canonical_encoding_round_trips_and_is_stable() {
+        let d = parse::<Pk>(ALLOWANCE).unwrap();
+        let printed = to_string(&d);
+        // Re-parsing the canonical form yields an equal descriptor.
+        let reparsed = parse::<Pk>(&printed).expect("reparse canonical form");
+        assert_eq!(d, reparsed);
+        // Printing is deterministic.
+        assert_eq!(printed, to_string(&reparsed));
     }
 }
