@@ -57,12 +57,11 @@ fn witness_signed_by(op: &MockOp, signers: &[&str]) -> Witness<Pk> {
     w
 }
 
-/// A mock operation: a type tag, named arguments, and optional modification path/subtree.
+/// A mock operation: a type tag, named arguments (modification target/content live here too), and
+/// a nonce.
 struct MockOp {
     ty: &'static str,
     args: BTreeMap<String, Value<Pk>>,
-    path: Option<Vec<usize>>,
-    subtree: Option<super::ast::BTerm<Pk>>,
     nonce: u64,
 }
 
@@ -71,13 +70,16 @@ impl MockOp {
         let mut args = BTreeMap::new();
         args.insert("amount".to_string(), Value::Int(amount));
         args.insert("destination".to_string(), Value::Key(destination.to_string()));
-        MockOp { ty: "spend", args, path: None, subtree: None, nonce: 0 }
+        MockOp { ty: "spend", args, nonce: 0 }
     }
     fn of_type(ty: &'static str) -> Self {
-        MockOp { ty, args: BTreeMap::new(), path: None, subtree: None, nonce: 0 }
+        MockOp { ty, args: BTreeMap::new(), nonce: 0 }
     }
     fn replace(path: Vec<usize>, subtree: super::ast::BTerm<Pk>) -> Self {
-        MockOp { ty: "replace", args: BTreeMap::new(), path: Some(path), subtree: Some(subtree), nonce: 0 }
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), Value::Path(path));
+        args.insert("subtree".to_string(), Value::Subtree(Box::new(subtree)));
+        MockOp { ty: "replace", args, nonce: 0 }
     }
     fn with_nonce(mut self, nonce: u64) -> Self {
         self.nonce = nonce;
@@ -87,12 +89,9 @@ impl MockOp {
 
 impl Operation<Pk> for MockOp {
     fn op_type(&self) -> Symbol { Symbol::new(self.ty) }
-    fn arg(&self, name: &str) -> Option<Value<Pk>> { self.args.get(name).cloned() }
     fn args(&self) -> Vec<(String, Value<Pk>)> {
         self.args.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
-    fn path(&self) -> Option<Vec<usize>> { self.path.clone() }
-    fn subtree(&self) -> Option<super::ast::BTerm<Pk>> { self.subtree.clone() }
     fn deposit_id(&self) -> [u8; 32] { [0u8; 32] }
     fn nonce(&self) -> u64 { self.nonce }
     fn expiry(&self) -> u32 { u32::MAX }
@@ -935,5 +934,50 @@ mod snapshot_codec {
             decode_snapshot(&bytes),
             Err(crate::calculus::encode::DecodeError::NonCanonicalOrder),
         );
+    }
+}
+
+mod operation_codec {
+    use super::*;
+    use crate::calculus::ast::BTerm;
+    use crate::calculus::encode::{decode_operation, operation_preimage, operation_sighash};
+    use crate::calculus::host::OperationData;
+
+    #[test]
+    fn modification_signature_binds_path_and_subtree() {
+        // Two replace operations differing only in the target path must not share a sighash, so a
+        // signature authorizing one does not authorize the other.
+        let a = MockOp::replace(vec![0], BTerm::Const(true));
+        let b = MockOp::replace(vec![5], BTerm::Const(true));
+        assert_ne!(operation_preimage(&a), operation_preimage(&b));
+        assert_ne!(
+            operation_sighash(&operation_preimage(&a)),
+            operation_sighash(&operation_preimage(&b)),
+        );
+
+        // And differing only in the subtree content.
+        let c = MockOp::replace(vec![0], BTerm::Const(false));
+        assert_ne!(operation_preimage(&a), operation_preimage(&c));
+    }
+
+    #[test]
+    fn operation_round_trips_through_the_codec() {
+        let op = MockOp::spend(1234, "alice").with_nonce(42);
+        let bytes = operation_preimage(&op);
+        let decoded: OperationData<Pk> = decode_operation::<Pk>(&bytes).expect("decode");
+        // Re-encoding the decoded operation reproduces the same canonical bytes.
+        assert_eq!(operation_preimage(&decoded), bytes);
+        // And the decoded fields match.
+        assert_eq!(decoded.op_type.as_str(), "spend");
+        assert_eq!(decoded.nonce, 42);
+        assert_eq!(decoded.arg("amount"), Some(Value::Int(1234)));
+    }
+
+    #[test]
+    fn a_decoded_modification_recovers_its_path_and_subtree() {
+        let op = MockOp::replace(vec![1, 2], BTerm::Const(false));
+        let decoded = decode_operation::<Pk>(&operation_preimage(&op)).unwrap();
+        assert_eq!(decoded.path(), Some(vec![1, 2]));
+        assert_eq!(decoded.subtree(), Some(BTerm::Const(false)));
     }
 }

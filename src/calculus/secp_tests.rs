@@ -36,17 +36,9 @@ struct Op {
 
 impl super::host::Operation<Pk> for Op {
     fn op_type(&self) -> Symbol { Symbol::new(self.ty) }
-    fn arg(&self, name: &str) -> Option<Value<Pk>> {
-        match name {
-            "amount" => Some(Value::Int(self.amount)),
-            _ => None,
-        }
-    }
     fn args(&self) -> Vec<(String, Value<Pk>)> {
         vec![("amount".to_string(), Value::Int(self.amount))]
     }
-    fn path(&self) -> Option<Vec<usize>> { None }
-    fn subtree(&self) -> Option<BTerm<Pk>> { None }
     fn deposit_id(&self) -> [u8; 32] { [0u8; 32] }
     fn nonce(&self) -> u64 { 0 }
     fn expiry(&self) -> u32 { u32::MAX }

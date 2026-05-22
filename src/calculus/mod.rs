@@ -43,12 +43,13 @@ pub use self::admission::{admit, check_polarity, AdmissionError};
 pub use self::ast::{BTerm, Descriptor, Obligation, VTerm};
 pub use self::capability::{CapabilitySet, ObligationKind};
 pub use self::encode::{
-    decode_descriptor, decode_snapshot, descriptor_id, encode_descriptor, encode_snapshot,
-    operation_preimage, operation_sighash, snapshot_id, tagged_hash, CanonicalKey, DecodeError,
+    decode_descriptor, decode_operation, decode_snapshot, descriptor_id, encode_descriptor,
+    encode_snapshot, operation_preimage, operation_sighash, snapshot_id, tagged_hash, CanonicalKey,
+    DecodeError,
 };
 pub use self::eval::{eval_b, evaluate, Env, EvalError};
 pub use self::fraud::{replay, ReplayOutcome};
-pub use self::host::{LedgerState, Operation};
+pub use self::host::{LedgerState, Operation, OperationData};
 pub use self::modify::{admit_modification, candidate, ModificationRejected, ModifyError};
 pub use self::parse::{parse, ParseError};
 pub use self::registry::{CmpOp, StatePred, Symbol, ValueFn};

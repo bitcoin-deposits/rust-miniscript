@@ -557,6 +557,43 @@ pub fn operation_sighash(preimage: &[u8]) -> [u8; 32] {
     tagged_hash("dep17/operation", preimage)
 }
 
+/// Decode an operation from its canonical preimage encoding (the inverse of
+/// [`operation_preimage`]), rejecting non-canonical input. The result is an
+/// [`OperationData`](super::host::OperationData), the concrete transmittable operation.
+pub fn decode_operation<Pk: MiniscriptKey + CanonicalKey>(
+    buf: &[u8],
+) -> Result<super::host::OperationData<Pk>, DecodeError> {
+    let mut d = Decoder::new(buf);
+    let version = d.u8()?;
+    if version != 0x01 {
+        return Err(DecodeError::BadVersion(version));
+    }
+    let mut deposit_id = [0u8; 32];
+    deposit_id.copy_from_slice(d.take(32)?);
+    let op_type = Symbol::new(d.symbol()?);
+    let n = d.u32()?;
+    let mut args = BTreeMap::new();
+    let mut prev: Option<String> = None;
+    for _ in 0..n {
+        let name = d.symbol()?;
+        if !is_canonical_name(&name) {
+            return Err(DecodeError::InvalidName);
+        }
+        if let Some(prev) = &prev {
+            if &name <= prev {
+                return Err(DecodeError::NonCanonicalOrder);
+            }
+        }
+        let value = dec_value(&mut d)?;
+        prev = Some(name.clone());
+        args.insert(name, value);
+    }
+    let nonce = d.u64()?;
+    let expiry = d.u32()?;
+    d.finish()?;
+    Ok(super::host::OperationData { op_type, args, deposit_id, nonce, expiry })
+}
+
 // ----------------------------------------------------------------------------------------------
 // dep-17 decoding (with canonical rejection)
 // ----------------------------------------------------------------------------------------------
@@ -612,6 +649,12 @@ impl<'a> Decoder<'a> {
     fn u32(&mut self) -> Result<u32, DecodeError> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, DecodeError> {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(self.take(8)?);
+        Ok(u64::from_be_bytes(a))
     }
 
     fn int(&mut self) -> Result<i128, DecodeError> {
