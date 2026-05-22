@@ -104,6 +104,7 @@ struct MockLedger {
     since_open: i128,
     since_received: i128,
     rolling_out: i128,
+    cumulative: i128,
     height: i128,
 }
 
@@ -115,6 +116,7 @@ impl Default for MockLedger {
             since_open: 0,
             since_received: 0,
             rolling_out: 0,
+            cumulative: 0,
             height: 0,
         }
     }
@@ -132,7 +134,7 @@ impl LedgerState for MockLedger {
             0
         }
     }
-    fn cumulative_spent_via(&self, _path: &[usize]) -> i128 { 0 }
+    fn cumulative_spent_via(&self, _path: &[usize]) -> i128 { self.cumulative }
     fn current_height(&self) -> i128 { self.height }
 }
 
@@ -1177,6 +1179,49 @@ mod templates {
         let d = parse::<Pk>(SOCIAL_RECOVERY).unwrap();
         let updated = admit_modification(&d, &op, &CapabilitySet::everything()).expect("admitted");
         assert_eq!(updated.body.subterm_at(&[0]), Some(&new_owner));
+    }
+
+    // ----- linear vesting ----------------------------------------------------------------------
+    // The beneficiary may withdraw only up to the linearly-vested fraction of an allocation:
+    // vested = allocation * min(elapsed, vesting_blocks) / vesting_blocks, and the total ever
+    // withdrawn (cumulative spend on this path, plus this operation's amount) must stay within it.
+    // This is the arithmetic + cumulative-spend path: a real release schedule, not just a cliff.
+    const VESTING: &str = "
+        with(beneficiary = K1, allocation = 1000000, vesting_blocks = 52560,
+          in match(operation_type(),
+            branch(spend, and(
+              prove(pk(beneficiary)),
+              cmp(<=,
+                add(cumulative_spent_via(path(0)), operation_arg(amount)),
+                div(mul(allocation, min(blocks_since_open(), vesting_blocks)), vesting_blocks)
+              )
+            )),
+            branch(else, false)
+          ))";
+
+    #[test]
+    fn linear_vesting_releases_over_time() {
+        // Halfway through the schedule: 500_000 of 1_000_000 is vested.
+        let half = MockLedger { since_open: 26_280, ..MockLedger::default() };
+
+        // Nothing withdrawn yet: a draw within the vested half is allowed...
+        let ok = MockOp::spend(400_000, "x");
+        assert!(decide(VESTING, &ok, &half, &["K1"]));
+        // ...but over the vested amount is not.
+        let over = MockOp::spend(600_000, "x");
+        assert!(!decide(VESTING, &over, &half, &["K1"]));
+
+        // With most already withdrawn, only the remaining vested slice is available.
+        let mostly_drawn = MockLedger { since_open: 26_280, cumulative: 450_000, ..MockLedger::default() };
+        assert!(decide(VESTING, &MockOp::spend(40_000, "x"), &mostly_drawn, &["K1"]));   // 490k <= 500k
+        assert!(!decide(VESTING, &MockOp::spend(100_000, "x"), &mostly_drawn, &["K1"])); // 550k > 500k
+
+        // After the schedule completes, the whole allocation is available.
+        let done = MockLedger { since_open: 60_000, ..MockLedger::default() };
+        assert!(decide(VESTING, &MockOp::spend(1_000_000, "x"), &done, &["K1"]));
+
+        // Not the beneficiary: rejected regardless of vesting.
+        assert!(!decide(VESTING, &ok, &done, &["K2"]));
     }
 
     // ----- Liana (decaying multisig) -----------------------------------------------------------
