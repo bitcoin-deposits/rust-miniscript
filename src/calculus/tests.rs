@@ -102,19 +102,28 @@ struct MockLedger {
     balance: i128,
     since_activity: i128,
     since_open: i128,
+    since_received: i128,
     rolling_out: i128,
     height: i128,
 }
 
 impl Default for MockLedger {
     fn default() -> Self {
-        MockLedger { balance: 1000, since_activity: 0, since_open: 0, rolling_out: 0, height: 0 }
+        MockLedger {
+            balance: 1000,
+            since_activity: 0,
+            since_open: 0,
+            since_received: 0,
+            rolling_out: 0,
+            height: 0,
+        }
     }
 }
 
 impl LedgerState for MockLedger {
     fn blocks_since_activity(&self) -> i128 { self.since_activity }
     fn blocks_since_open(&self) -> i128 { self.since_open }
+    fn blocks_since_received(&self) -> i128 { self.since_received }
     fn balance(&self) -> i128 { self.balance }
     fn rolling_window(&self, field: &str, _period: i128) -> i128 {
         if field == "amount_out" {
@@ -884,6 +893,7 @@ mod snapshot_codec {
             balance: 1_000_000,
             blocks_since_activity: 12,
             blocks_since_open: 9000,
+            blocks_since_received: 300,
             height: 850_000,
             rolling,
             cumulative_spent,
@@ -1200,5 +1210,66 @@ mod templates {
         // blocks recovery. This is the decaying-multisig point.
         let reset = MockLedger { since_activity: 5, since_open: 70_000, ..MockLedger::default() };
         assert!(!decide(LIANA, &op, &reset, &["K3"]));
+    }
+}
+
+mod ledger_primitives {
+    use super::*;
+
+    // A vesting cliff: the beneficiary may spend only after a fixed span since the deposit opened,
+    // and — unlike `older` — this does NOT reset when the owner spends in the meantime.
+    const VESTING: &str = "
+        with(owner = K1, beneficiary = K2, in match(operation_type(),
+          branch(spend, or(
+            prove(pk(owner)),
+            and(prove(pk(beneficiary)), blocks_since_open_at_least(26280))
+          )),
+          branch(else, false)
+        ))";
+
+    #[test]
+    fn since_open_is_a_non_resetting_cliff() {
+        let op = MockOp::spend(100, "x");
+        // Before the cliff: beneficiary blocked even though there's been no recent activity.
+        let early = MockLedger { since_open: 1000, since_activity: 99_999, ..MockLedger::default() };
+        assert!(!decide(VESTING, &op, &early, &["K2"]));
+        // After the cliff: beneficiary may spend, even if the owner just spent (since_activity low)
+        // — the open-timer does not reset.
+        let vested = MockLedger { since_open: 30_000, since_activity: 1, ..MockLedger::default() };
+        assert!(decide(VESTING, &op, &vested, &["K2"]));
+    }
+
+    // A dead-man's-switch keyed on incoming payments: a backup key activates if no payment has
+    // been received for a long time, independent of whether the owner has been spending.
+    const NO_RECEIPT: &str = "
+        with(owner = K1, backup = K2, in match(operation_type(),
+          branch(spend, or(
+            prove(pk(owner)),
+            and(prove(pk(backup)), blocks_since_received_at_least(52560))
+          )),
+          branch(else, false)
+        ))";
+
+    #[test]
+    fn since_received_gates_on_incoming_payments() {
+        let op = MockOp::spend(100, "x");
+        // A payment arrived recently: backup blocked.
+        let recent = MockLedger { since_received: 100, ..MockLedger::default() };
+        assert!(!decide(NO_RECEIPT, &op, &recent, &["K2"]));
+        // No payment for a long time: backup activates, regardless of spend activity.
+        let dry = MockLedger { since_received: 60_000, since_activity: 5, ..MockLedger::default() };
+        assert!(decide(NO_RECEIPT, &op, &dry, &["K2"]));
+    }
+
+    #[test]
+    fn new_primitives_admit_and_round_trip() {
+        use crate::calculus::admission::admit;
+        use crate::calculus::capability::CapabilitySet;
+        use crate::calculus::encode::{decode_descriptor, encode_descriptor};
+        for src in [VESTING, NO_RECEIPT] {
+            let d = parse::<Pk>(src).unwrap();
+            assert!(admit(&d, &CapabilitySet::everything()).is_ok());
+            assert_eq!(d, decode_descriptor::<Pk>(&encode_descriptor(&d)).unwrap());
+        }
     }
 }

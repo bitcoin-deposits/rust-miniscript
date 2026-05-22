@@ -101,6 +101,9 @@ pub trait LedgerState {
     /// Blocks since the deposit was opened.
     fn blocks_since_open(&self) -> i128;
 
+    /// Blocks since the deposit's last incoming payment was accepted.
+    fn blocks_since_received(&self) -> i128;
+
     /// The deposit's current balance.
     fn balance(&self) -> i128;
 

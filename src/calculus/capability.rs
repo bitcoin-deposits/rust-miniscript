@@ -45,7 +45,7 @@ impl<Pk: crate::MiniscriptKey> Obligation<Pk> {
 }
 
 /// Every value function, for building unrestricted capability sets.
-const ALL_VALUE_FNS: [ValueFn; 20] = [
+const ALL_VALUE_FNS: [ValueFn; 21] = [
     ValueFn::Add,
     ValueFn::Sub,
     ValueFn::Mul,
@@ -66,9 +66,10 @@ const ALL_VALUE_FNS: [ValueFn; 20] = [
     ValueFn::AstRef,
     ValueFn::AstShapeAt,
     ValueFn::Path,
+    ValueFn::BlocksSinceReceived,
 ];
 
-const ALL_STATE_PREDS: [StatePred; 14] = [
+const ALL_STATE_PREDS: [StatePred; 16] = [
     StatePred::Older,
     StatePred::After,
     StatePred::AmountAtMost,
@@ -83,6 +84,8 @@ const ALL_STATE_PREDS: [StatePred; 14] = [
     StatePred::RollingAmountBelow,
     StatePred::RollingAmountBelowPct,
     StatePred::SubtreeAt,
+    StatePred::BlocksSinceOpenAtLeast,
+    StatePred::BlocksSinceReceivedAtLeast,
 ];
 
 const ALL_OBLIGATIONS: [ObligationKind; 6] = [

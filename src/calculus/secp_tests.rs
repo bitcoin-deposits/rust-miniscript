@@ -48,6 +48,7 @@ struct NoLedger;
 impl super::host::LedgerState for NoLedger {
     fn blocks_since_activity(&self) -> i128 { 0 }
     fn blocks_since_open(&self) -> i128 { 0 }
+    fn blocks_since_received(&self) -> i128 { 0 }
     fn balance(&self) -> i128 { 0 }
     fn rolling_window(&self, _f: &str, _p: i128) -> i128 { 0 }
     fn cumulative_spent_via(&self, _p: &[usize]) -> i128 { 0 }

@@ -312,6 +312,7 @@ fn valuefn_id(f: ValueFn) -> u16 {
         ValueFn::AstRef => 17,
         ValueFn::AstShapeAt => 18,
         ValueFn::Path => 19,
+        ValueFn::BlocksSinceReceived => 20,
     }
 }
 
@@ -331,6 +332,8 @@ fn statepred_id(p: StatePred) -> u16 {
         StatePred::RollingAmountBelow => 11,
         StatePred::RollingAmountBelowPct => 12,
         StatePred::SubtreeAt => 13,
+        StatePred::BlocksSinceOpenAtLeast => 14,
+        StatePred::BlocksSinceReceivedAtLeast => 15,
     }
 }
 
@@ -737,6 +740,7 @@ fn valuefn_from_id(id: u16) -> Result<ValueFn, DecodeError> {
         17 => ValueFn::AstRef,
         18 => ValueFn::AstShapeAt,
         19 => ValueFn::Path,
+        20 => ValueFn::BlocksSinceReceived,
         _ => return Err(DecodeError::UnknownTag("valuefn", id as u32)),
     })
 }
@@ -757,6 +761,8 @@ fn statepred_from_id(id: u16) -> Result<StatePred, DecodeError> {
         11 => StatePred::RollingAmountBelow,
         12 => StatePred::RollingAmountBelowPct,
         13 => StatePred::SubtreeAt,
+        14 => StatePred::BlocksSinceOpenAtLeast,
+        15 => StatePred::BlocksSinceReceivedAtLeast,
         _ => return Err(DecodeError::UnknownTag("statepred", id as u32)),
     })
 }
@@ -986,6 +992,7 @@ pub fn encode_snapshot(s: &super::snapshot::Snapshot) -> Vec<u8> {
     put_int(&mut out, s.balance);
     put_u32(&mut out, s.blocks_since_activity);
     put_u32(&mut out, s.blocks_since_open);
+    put_u32(&mut out, s.blocks_since_received);
     put_u32(&mut out, s.height);
 
     // Rolling windows, sorted by (field id, period). Entries with an unregistered field are
@@ -1030,6 +1037,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<super::snapshot::Snapshot, DecodeEr
     let balance = d.int()?;
     let blocks_since_activity = d.u32()?;
     let blocks_since_open = d.u32()?;
+    let blocks_since_received = d.u32()?;
     let height = d.u32()?;
 
     let mut rolling = BTreeMap::new();
@@ -1073,6 +1081,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<super::snapshot::Snapshot, DecodeEr
         balance,
         blocks_since_activity,
         blocks_since_open,
+        blocks_since_received,
         height,
         rolling,
         cumulative_spent,

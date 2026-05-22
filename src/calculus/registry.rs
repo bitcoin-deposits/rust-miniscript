@@ -92,6 +92,8 @@ pub enum ValueFn {
     AstShapeAt,
     /// Construct a path value from a sequence of indices.
     Path,
+    /// Blocks since the deposit's last incoming payment was accepted.
+    BlocksSinceReceived,
 }
 
 impl ValueFn {
@@ -118,6 +120,7 @@ impl ValueFn {
             ValueFn::AstRef => "ast_ref",
             ValueFn::AstShapeAt => "ast_shape_at",
             ValueFn::Path => "path",
+            ValueFn::BlocksSinceReceived => "blocks_since_received",
         }
     }
 
@@ -144,6 +147,7 @@ impl ValueFn {
             "ast_ref" => ValueFn::AstRef,
             "ast_shape_at" => ValueFn::AstShapeAt,
             "path" => ValueFn::Path,
+            "blocks_since_received" => ValueFn::BlocksSinceReceived,
             _ => return None,
         })
     }
@@ -183,6 +187,11 @@ pub enum StatePred {
     RollingAmountBelowPct,
     /// Structural equality of a value with the subtree at a path.
     SubtreeAt,
+    /// At least `n` blocks since the deposit was opened. Unlike `older`, this does not reset on
+    /// activity — a non-resetting cliff/vesting timer.
+    BlocksSinceOpenAtLeast,
+    /// At least `n` blocks since the deposit's last incoming payment.
+    BlocksSinceReceivedAtLeast,
 }
 
 impl StatePred {
@@ -203,6 +212,8 @@ impl StatePred {
             StatePred::RollingAmountBelow => "rolling_amount_below",
             StatePred::RollingAmountBelowPct => "rolling_amount_below_pct",
             StatePred::SubtreeAt => "subtree_at",
+            StatePred::BlocksSinceOpenAtLeast => "blocks_since_open_at_least",
+            StatePred::BlocksSinceReceivedAtLeast => "blocks_since_received_at_least",
         }
     }
 
@@ -223,6 +234,8 @@ impl StatePred {
             "rolling_amount_below" => StatePred::RollingAmountBelow,
             "rolling_amount_below_pct" => StatePred::RollingAmountBelowPct,
             "subtree_at" => StatePred::SubtreeAt,
+            "blocks_since_open_at_least" => StatePred::BlocksSinceOpenAtLeast,
+            "blocks_since_received_at_least" => StatePred::BlocksSinceReceivedAtLeast,
             _ => return None,
         })
     }

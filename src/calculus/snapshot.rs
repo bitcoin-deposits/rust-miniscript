@@ -23,6 +23,8 @@ pub struct Snapshot {
     pub blocks_since_activity: u32,
     /// Blocks since the deposit was opened.
     pub blocks_since_open: u32,
+    /// Blocks since the deposit's last incoming payment.
+    pub blocks_since_received: u32,
     /// The current block height.
     pub height: u32,
     /// Rolling-window totals, keyed by `(field, period)`. `field` is one of `amount_out`,
@@ -35,6 +37,7 @@ pub struct Snapshot {
 impl LedgerState for Snapshot {
     fn blocks_since_activity(&self) -> i128 { self.blocks_since_activity as i128 }
     fn blocks_since_open(&self) -> i128 { self.blocks_since_open as i128 }
+    fn blocks_since_received(&self) -> i128 { self.blocks_since_received as i128 }
     fn balance(&self) -> i128 { self.balance }
     fn rolling_window(&self, field: &str, period: i128) -> i128 {
         // A period that does not fit a u32 cannot have a recorded entry, so it reads as zero.

@@ -209,6 +209,7 @@ where
             .ok_or(EvalError::TypeMismatch("operation has no subtree")),
         ValueFn::BlocksSinceActivity => Ok(Value::Int(st.blocks_since_activity())),
         ValueFn::BlocksSinceOpen => Ok(Value::Int(st.blocks_since_open())),
+        ValueFn::BlocksSinceReceived => Ok(Value::Int(st.blocks_since_received())),
         ValueFn::DepositBalance => Ok(Value::Int(st.balance())),
         ValueFn::RollingWindow => {
             let field = eval_v(&args[0], env, root, op, st)?;
@@ -290,6 +291,8 @@ where
         StatePred::RollingAmountBelowPct => {
             Ok(st.rolling_window("amount_out", arg_int(1)?) <= pct(st.balance(), arg_int(0)?))
         }
+        StatePred::BlocksSinceOpenAtLeast => Ok(st.blocks_since_open() >= arg_int(0)?),
+        StatePred::BlocksSinceReceivedAtLeast => Ok(st.blocks_since_received() >= arg_int(0)?),
         StatePred::SubtreeAt => {
             // subtree_at(candidate, path): is `candidate` structurally the subtree at `path`?
             let p = match &args[1] {
