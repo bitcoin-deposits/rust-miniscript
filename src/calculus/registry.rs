@@ -50,7 +50,7 @@ impl CmpOp {
 
 /// Value-producing functions (sort `V`). Each is a total, deterministic function of the
 /// operation and ledger state, and is constant in the witness.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ValueFn {
     /// Saturating addition.
     Add,
@@ -152,7 +152,7 @@ impl ValueFn {
 /// Boolean state predicates (sort `B`): total, deterministic functions of the operation and
 /// ledger state, constant in the witness. They may appear freely under negation and as `if`
 /// conditions because they cannot be exploited by withholding witness data.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum StatePred {
     /// `older(n)`: a relative timelock has elapsed.
     Older,

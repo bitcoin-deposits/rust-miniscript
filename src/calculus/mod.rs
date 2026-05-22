@@ -18,7 +18,9 @@
 #[cfg(test)]
 mod tests;
 
+pub mod admission;
 pub mod ast;
+pub mod capability;
 pub mod eval;
 pub mod host;
 pub mod parse;
@@ -27,7 +29,9 @@ pub mod schema;
 pub mod value;
 pub mod witness;
 
+pub use self::admission::{admit, check_polarity, AdmissionError};
 pub use self::ast::{BTerm, Descriptor, Obligation, VTerm};
+pub use self::capability::{CapabilitySet, ObligationKind};
 pub use self::eval::{eval_b, Env, EvalError};
 pub use self::host::{LedgerState, Operation};
 pub use self::parse::{parse, ParseError};
