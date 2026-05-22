@@ -10,10 +10,11 @@
 //!
 //! Requires the `std` feature (for the secp256k1 context).
 
-use bitcoin::hashes::{sha256, Hash as _};
+use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::{ecdsa, All, Message, Secp256k1, SecretKey};
 use bitcoin::PublicKey;
 
+use super::encode::operation_sighash;
 use super::signature::{Signature, Verifier};
 use super::value::HashValue;
 
@@ -30,9 +31,10 @@ impl EcdsaVerifier {
     /// Construct a new verifier with its own secp256k1 context.
     pub fn new() -> Self { EcdsaVerifier { secp: Secp256k1::new() } }
 
-    /// The 32-byte digest a signature commits to: `sha256(message)`.
+    /// The 32-byte digest a signature commits to: the dep-17 operation sighash over the canonical
+    /// operation preimage that `message` carries.
     fn digest(message: &[u8]) -> Message {
-        Message::from_digest(sha256::Hash::hash(message).to_byte_array())
+        Message::from_digest(operation_sighash(message))
     }
 
     /// Produce a signature by `sk` over `message`, in the compact encoding this verifier expects.

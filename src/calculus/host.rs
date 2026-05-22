@@ -16,6 +16,11 @@ use super::registry::Symbol;
 use super::value::Value;
 
 /// The operation currently being authorized.
+///
+/// The components that a signature commits to — deposit id, type, arguments, nonce, expiry — are
+/// exposed individually; the calculus builds the canonical signing preimage from them (via
+/// [`encode::operation_preimage`](super::encode::operation_preimage)) so that no operation
+/// implementation can diverge on the encoding.
 pub trait Operation<Pk: MiniscriptKey> {
     /// The operation's type, as a symbol (`spend`, `insert`, ...).
     fn op_type(&self) -> Symbol;
@@ -23,17 +28,26 @@ pub trait Operation<Pk: MiniscriptKey> {
     /// A named argument of the operation (`amount`, `destination`, ...), if present.
     fn arg(&self, name: &str) -> Option<Value<Pk>>;
 
+    /// All named arguments of the operation. Used to build the canonical signing preimage; order
+    /// is irrelevant (the encoder sorts by name).
+    fn args(&self) -> Vec<(String, Value<Pk>)>;
+
     /// The ast path targeted by a modification operation, if this is one.
     fn path(&self) -> Option<Vec<usize>>;
 
     /// The subtree introduced by an `insert` or `replace`, if this is one.
     fn subtree(&self) -> Option<BTerm<Pk>>;
 
-    /// The canonical message a signature over this operation commits to. The exact encoding (which
-    /// binds the deposit id, operation type, arguments, nonce, and expiry) is fixed by the
-    /// canonical-encoding specification; the evaluator treats it as opaque bytes that signatures
-    /// are checked against.
-    fn signing_message(&self) -> Vec<u8>;
+    /// The deposit's id: the 32-byte domain separator that makes signatures non-replayable across
+    /// deposits.
+    fn deposit_id(&self) -> [u8; 32];
+
+    /// The operation's nonce (replay protection; enforced by the protocol, not the descriptor).
+    fn nonce(&self) -> u64;
+
+    /// The block height after which a signature over this operation is invalid (enforced by the
+    /// protocol, not the descriptor).
+    fn expiry(&self) -> u32;
 }
 
 /// A snapshot of the deposit's ledger state at the time of authorization. All quantities are

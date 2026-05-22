@@ -16,6 +16,7 @@ use crate::prelude::*;
 use crate::MiniscriptKey;
 
 use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::encode::{operation_preimage, CanonicalKey};
 use super::host::{LedgerState, Operation};
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
 use super::signature::Verifier;
@@ -51,7 +52,7 @@ pub fn evaluate<Pk, O, L, V>(
     verifier: &V,
 ) -> Result<bool, EvalError>
 where
-    Pk: MiniscriptKey,
+    Pk: MiniscriptKey + CanonicalKey,
     O: Operation<Pk>,
     L: LedgerState,
     V: Verifier<Pk>,
@@ -76,7 +77,7 @@ pub fn eval_b<Pk, O, L, V>(
     verifier: &V,
 ) -> Result<bool, EvalError>
 where
-    Pk: MiniscriptKey,
+    Pk: MiniscriptKey + CanonicalKey,
     O: Operation<Pk>,
     L: LedgerState,
     V: Verifier<Pk>,
@@ -332,7 +333,7 @@ pub fn verify_o<Pk, O, L, V>(
     st: &L,
 ) -> Result<bool, EvalError>
 where
-    Pk: MiniscriptKey,
+    Pk: MiniscriptKey + CanonicalKey,
     O: Operation<Pk>,
     L: LedgerState,
     V: Verifier<Pk>,
@@ -355,11 +356,13 @@ where
             _ => Err(EvalError::TypeMismatch("expected a list of keys")),
         }
     };
+    // The canonical signing preimage this operation's signatures commit to.
+    let message = operation_preimage(op);
     // A signature by `key` is valid iff the witness carries an entry under that key that the
     // verifier accepts over the operation's signing message.
     let signed_by = |key: &Pk| -> bool {
         match w.signatures.get(key) {
-            Some(sig) => verifier.verify_signature(key, sig, &op.signing_message()),
+            Some(sig) => verifier.verify_signature(key, sig, &message),
             None => false,
         }
     };
@@ -377,9 +380,8 @@ where
                 Value::Hash(h) => h,
                 _ => return Err(EvalError::TypeMismatch("pk_h expects a key hash")),
             };
-            let msg = op.signing_message();
             Ok(w.signatures.iter().any(|(k, sig)| {
-                verifier.key_hashes_to(k, &keyhash) && verifier.verify_signature(k, sig, &msg)
+                verifier.key_hashes_to(k, &keyhash) && verifier.verify_signature(k, sig, &message)
             }))
         }
         Obligation::Hashlock(v) => {

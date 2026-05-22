@@ -11,6 +11,7 @@
 use crate::MiniscriptKey;
 
 use super::ast::Descriptor;
+use super::encode::CanonicalKey;
 use super::eval::{evaluate, EvalError};
 use super::host::{LedgerState, Operation};
 use super::signature::Verifier;
@@ -40,7 +41,7 @@ pub fn replay<Pk, O, L, V>(
     claimed: bool,
 ) -> Result<ReplayOutcome, EvalError>
 where
-    Pk: MiniscriptKey,
+    Pk: MiniscriptKey + CanonicalKey,
     O: Operation<Pk>,
     L: LedgerState,
     V: Verifier<Pk>,

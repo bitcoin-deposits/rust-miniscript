@@ -42,11 +42,14 @@ impl super::host::Operation<Pk> for Op {
             _ => None,
         }
     }
+    fn args(&self) -> Vec<(String, Value<Pk>)> {
+        vec![("amount".to_string(), Value::Int(self.amount))]
+    }
     fn path(&self) -> Option<Vec<usize>> { None }
     fn subtree(&self) -> Option<BTerm<Pk>> { None }
-    fn signing_message(&self) -> Vec<u8> {
-        format!("op={};amount={}", self.ty, self.amount).into_bytes()
-    }
+    fn deposit_id(&self) -> [u8; 32] { [0u8; 32] }
+    fn nonce(&self) -> u64 { 0 }
+    fn expiry(&self) -> u32 { u32::MAX }
 }
 
 struct NoLedger;
@@ -69,7 +72,7 @@ fn real_signature_authorizes_and_binds_to_the_operation() {
     let other = Op { ty: "spend", amount: 200 };
 
     // A real signature over this operation's message.
-    let sig = v.sign(&sk, &super::host::Operation::signing_message(&op));
+    let sig = v.sign(&sk, &super::encode::operation_preimage(&op));
     let w = Witness::empty().with_signature(pk, sig);
 
     // Authorizes the operation it signed...
@@ -87,7 +90,7 @@ fn signature_by_the_wrong_key_is_rejected() {
 
     let op = Op { ty: "spend", amount: 100 };
     // A valid signature, but by the wrong key, placed under the expected key.
-    let sig_b = v.sign(&sk_b, &super::host::Operation::signing_message(&op));
+    let sig_b = v.sign(&sk_b, &super::encode::operation_preimage(&op));
     let w = Witness::empty().with_signature(pk_a, sig_b);
     assert!(!evaluate(&d, &op, &NoLedger, &w, &v).unwrap());
 }
@@ -111,7 +114,7 @@ fn real_threshold_signing() {
     let d = parse::<Pk>(&format!("prove(pk_threshold(2, [{}, {}, {}]))", pk1, pk2, pk3)).unwrap();
 
     let op = Op { ty: "spend", amount: 100 };
-    let msg = super::host::Operation::signing_message(&op);
+    let msg = super::encode::operation_preimage(&op);
 
     // Two of three sign: authorized.
     let w2 = Witness::empty()
@@ -138,7 +141,7 @@ fn real_pk_h_matches_hash160_of_the_key() {
     let d = Descriptor { constants: BTreeMap::new(), body };
 
     let op = Op { ty: "spend", amount: 100 };
-    let msg = super::host::Operation::signing_message(&op);
+    let msg = super::encode::operation_preimage(&op);
 
     // The matching key signs: authorized.
     let w = Witness::empty().with_signature(pk, v.sign(&sk, &msg));

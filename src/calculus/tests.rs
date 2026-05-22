@@ -4,6 +4,7 @@
 
 use crate::prelude::*;
 
+use super::encode::{operation_preimage, CanonicalKey};
 use super::eval::{eval_b, evaluate};
 use super::host::{LedgerState, Operation};
 use super::parse::parse;
@@ -13,6 +14,10 @@ use super::value::{HashValue, Value};
 use super::witness::Witness;
 
 type Pk = String;
+
+impl CanonicalKey for String {
+    fn to_canonical_bytes(&self) -> Vec<u8> { self.as_bytes().to_vec() }
+}
 
 /// The mock signature scheme used throughout the tests: a valid signature by `key` over `msg` is
 /// the bytes `key | "|" | msg`. This binds a signature to both the key and the exact operation
@@ -40,9 +45,10 @@ impl Verifier<Pk> for MockVerifier {
     }
 }
 
-/// Build a witness signing `op` with each of `signers` under the mock scheme.
+/// Build a witness signing `op` with each of `signers` under the mock scheme. The message signed
+/// is the real dep-17 canonical operation preimage.
 fn witness_signed_by(op: &MockOp, signers: &[&str]) -> Witness<Pk> {
-    let msg = op.signing_message();
+    let msg = operation_preimage(op);
     let mut w = Witness::empty();
     for s in signers {
         w = w.with_signature(s.to_string(), mock_sig(s, &msg));
@@ -56,6 +62,7 @@ struct MockOp {
     args: BTreeMap<String, Value<Pk>>,
     path: Option<Vec<usize>>,
     subtree: Option<super::ast::BTerm<Pk>>,
+    nonce: u64,
 }
 
 impl MockOp {
@@ -63,26 +70,31 @@ impl MockOp {
         let mut args = BTreeMap::new();
         args.insert("amount".to_string(), Value::Int(amount));
         args.insert("destination".to_string(), Value::Key(destination.to_string()));
-        MockOp { ty: "spend", args, path: None, subtree: None }
+        MockOp { ty: "spend", args, path: None, subtree: None, nonce: 0 }
     }
     fn of_type(ty: &'static str) -> Self {
-        MockOp { ty, args: BTreeMap::new(), path: None, subtree: None }
+        MockOp { ty, args: BTreeMap::new(), path: None, subtree: None, nonce: 0 }
     }
     fn replace(path: Vec<usize>, subtree: super::ast::BTerm<Pk>) -> Self {
-        MockOp { ty: "replace", args: BTreeMap::new(), path: Some(path), subtree: Some(subtree) }
+        MockOp { ty: "replace", args: BTreeMap::new(), path: Some(path), subtree: Some(subtree), nonce: 0 }
+    }
+    fn with_nonce(mut self, nonce: u64) -> Self {
+        self.nonce = nonce;
+        self
     }
 }
 
 impl Operation<Pk> for MockOp {
     fn op_type(&self) -> Symbol { Symbol::new(self.ty) }
     fn arg(&self, name: &str) -> Option<Value<Pk>> { self.args.get(name).cloned() }
+    fn args(&self) -> Vec<(String, Value<Pk>)> {
+        self.args.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
     fn path(&self) -> Option<Vec<usize>> { self.path.clone() }
     fn subtree(&self) -> Option<super::ast::BTerm<Pk>> { self.subtree.clone() }
-    fn signing_message(&self) -> Vec<u8> {
-        // A deterministic encoding binding the operation type and its arguments. The real
-        // canonical encoding is specified elsewhere; this suffices to bind signatures in tests.
-        format!("op={};args={:?}", self.ty, self.args).into_bytes()
-    }
+    fn deposit_id(&self) -> [u8; 32] { [0u8; 32] }
+    fn nonce(&self) -> u64 { self.nonce }
+    fn expiry(&self) -> u32 { u32::MAX }
 }
 
 /// A mock ledger snapshot.
@@ -663,5 +675,53 @@ mod fraud_and_encoding {
         assert_eq!(d, reparsed);
         // Printing is deterministic.
         assert_eq!(printed, to_string(&reparsed));
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// dep-17 byte encodings
+// ----------------------------------------------------------------------------------------------
+
+mod encoding {
+    use super::*;
+    use crate::calculus::encode::{descriptor_id, encode_descriptor, operation_preimage, operation_sighash, tagged_hash};
+
+    #[test]
+    fn descriptor_id_is_stable_and_sensitive() {
+        let d = parse::<Pk>(ALLOWANCE).unwrap();
+        // Stable: the commitment depends only on the descriptor.
+        assert_eq!(descriptor_id(&d), descriptor_id(&d));
+        assert_eq!(encode_descriptor(&d), encode_descriptor(&d));
+        // Sensitive: a structurally different descriptor commits differently.
+        let other = parse::<Pk>("prove(pk(K1))").unwrap();
+        assert_ne!(descriptor_id(&d), descriptor_id(&other));
+    }
+
+    #[test]
+    fn signing_preimage_binds_nonce() {
+        // Two operations identical but for the nonce produce different sighashes, so a signature
+        // is not replayable across nonces.
+        let op0 = MockOp::spend(100, "alice").with_nonce(7);
+        let op1 = MockOp::spend(100, "alice").with_nonce(8);
+        assert_ne!(operation_preimage(&op0), operation_preimage(&op1));
+        assert_ne!(
+            operation_sighash(&operation_preimage(&op0)),
+            operation_sighash(&operation_preimage(&op1)),
+        );
+    }
+
+    #[test]
+    fn signing_preimage_binds_type_and_args() {
+        let spend = MockOp::spend(100, "alice");
+        let other_amount = MockOp::spend(101, "alice");
+        let insert = MockOp::of_type("insert");
+        assert_ne!(operation_preimage(&spend), operation_preimage(&other_amount));
+        assert_ne!(operation_preimage(&spend), operation_preimage(&insert));
+    }
+
+    #[test]
+    fn tagged_hash_is_domain_separated() {
+        // The same message under different tags yields different digests.
+        assert_ne!(tagged_hash("dep17/operation", b"x"), tagged_hash("dep17/descriptor", b"x"));
     }
 }
