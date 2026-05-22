@@ -1170,13 +1170,14 @@ mod templates {
     }
 
     // ----- Liana (decaying multisig) -----------------------------------------------------------
-    // The primary path is a 2-of-2; a recovery key becomes spendable only after a relative
-    // timelock. This is the Liana wallet shape: normal multisig now, single-key recovery later.
+    // The primary path is a 2-of-2; a recovery key becomes spendable only after a span of
+    // inactivity. This is the Liana wallet shape, and the point is that the recovery timer
+    // *resets on every spend* — so it gates on blocks-since-activity, not coin age.
     const LIANA: &str = "
         with(primary_a = K1, primary_b = K2, recovery = K3, in match(operation_type(),
           branch(spend, or(
             and(prove(pk(primary_a)), prove(pk(primary_b))),
-            and(prove(pk(recovery)), older(65535))
+            and(prove(pk(recovery)), blocks_since_activity_at_least(65535))
           )),
           branch(else, false)
         ))";
@@ -1188,11 +1189,15 @@ mod templates {
         assert!(decide(LIANA, &op, &MockLedger::default(), &["K1", "K2"]));
         // A single primary key is insufficient.
         assert!(!decide(LIANA, &op, &MockLedger::default(), &["K1"]));
-        // Recovery is blocked before the timelock matures (older reads blocks-since-open).
-        let young = MockLedger { since_open: 1000, ..MockLedger::default() };
-        assert!(!decide(LIANA, &op, &young, &["K3"]));
-        // Recovery spends once the timelock has elapsed.
-        let mature = MockLedger { since_open: 70_000, ..MockLedger::default() };
-        assert!(decide(LIANA, &op, &mature, &["K3"]));
+        // Recovery is blocked while the wallet has been active recently.
+        let active = MockLedger { since_activity: 1000, ..MockLedger::default() };
+        assert!(!decide(LIANA, &op, &active, &["K3"]));
+        // Recovery spends after the inactivity window.
+        let stale = MockLedger { since_activity: 70_000, ..MockLedger::default() };
+        assert!(decide(LIANA, &op, &stale, &["K3"]));
+        // The timer keys on activity, not coin age: an old deposit that was spent recently still
+        // blocks recovery. This is the decaying-multisig point.
+        let reset = MockLedger { since_activity: 5, since_open: 70_000, ..MockLedger::default() };
+        assert!(!decide(LIANA, &op, &reset, &["K3"]));
     }
 }
