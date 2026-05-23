@@ -47,11 +47,19 @@ impl EcdsaVerifier {
 
 impl Verifier<PublicKey> for EcdsaVerifier {
     fn verify_signature(&self, key: &PublicKey, sig: &Signature, message: &[u8]) -> bool {
-        let sig = match ecdsa::Signature::from_compact(&sig.0) {
+        let parsed = match ecdsa::Signature::from_compact(&sig.0) {
             Ok(s) => s,
             Err(_) => return false,
         };
-        self.secp.verify_ecdsa(&Self::digest(message), &sig, &key.inner).is_ok()
+        // Reject high-s signatures: normalize a copy and require it to match the original. This
+        // closes ECDSA malleability (each (key, message) admits exactly one canonical signature),
+        // so downstream code that keys on signature bytes cannot be confused by the high-s twin.
+        let mut normalized = parsed;
+        normalized.normalize_s();
+        if normalized != parsed {
+            return false;
+        }
+        self.secp.verify_ecdsa(&Self::digest(message), &parsed, &key.inner).is_ok()
     }
 
     fn key_hashes_to(&self, key: &PublicKey, keyhash: &HashValue) -> bool {

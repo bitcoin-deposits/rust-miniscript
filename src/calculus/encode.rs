@@ -963,7 +963,9 @@ fn dec_schema(d: &mut Decoder) -> Result<Schema, DecodeError> {
     })
 }
 
-fn is_canonical_name(name: &str) -> bool {
+/// Whether `name` is a canonical constant or operation-argument name (matches
+/// `[a-z_][a-z0-9_]*`). Enforced by both the decoder and the parser so source and bytes agree.
+pub(super) fn is_canonical_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c == '_' || c.is_ascii_lowercase() => {}

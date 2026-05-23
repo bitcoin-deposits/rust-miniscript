@@ -1396,3 +1396,32 @@ mod hardening {
         assert!(admit(&d, &CapabilitySet::everything()).is_ok());
     }
 }
+
+mod parser_edges {
+    use super::*;
+    use crate::calculus::ast::BTerm;
+
+    #[test]
+    fn invalid_constant_name_is_rejected_at_parse() {
+        // Uppercase/hyphen names won't survive decode, so they must not survive parse either.
+        assert!(parse::<Pk>("with(Bad_Name = 1, in true)").is_err());
+        assert!(parse::<Pk>("with(has-hyphen = 1, in true)").is_err());
+    }
+
+    #[test]
+    fn empty_hex_literal_is_rejected() {
+        // `0x` with no digits is ambiguous and serves no purpose; reject it explicitly.
+        let r = parse::<Pk>("with(x = 0x, in true)");
+        assert!(r.is_err(), "expected error for empty hex literal");
+    }
+
+    #[test]
+    fn negative_integer_literals_parse() {
+        // The value sublanguage is signed (i128); -N is a literal.
+        let d = parse::<Pk>("with(adj = -100, in true)").unwrap();
+        assert_eq!(d.constants.get("adj"), Some(&Value::Int(-100)));
+        // And inside an expression position.
+        let d2 = parse::<Pk>("cmp(<=, -100, 100)").unwrap();
+        assert!(matches!(d2.body, BTerm::Cmp(_, _, _)));
+    }
+}

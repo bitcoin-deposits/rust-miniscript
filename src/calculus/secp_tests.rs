@@ -14,7 +14,7 @@ use super::eval::evaluate;
 use super::parse::parse;
 use super::registry::Symbol;
 use super::secp::EcdsaVerifier;
-use super::signature::Signature;
+use super::signature::{Signature, Verifier};
 use super::value::{HashValue, Value};
 use super::witness::Witness;
 
@@ -208,4 +208,28 @@ mod schnorr {
         let back = decode_descriptor::<XPk>(&encode_descriptor(&d)).unwrap();
         assert_eq!(d, back);
     }
+}
+
+#[test]
+fn high_s_ecdsa_signature_is_rejected() {
+    // ECDSA admits two valid (r, s) pairs for the same (key, message): (r, s) and (r, N - s).
+    // We reject high-s to close that malleability. Verify by flipping a valid low-s signature.
+    let v = EcdsaVerifier::new();
+    let (sk, pk) = keypair(0x11);
+    let op = Op { ty: "spend", amount: 100 };
+    let msg = super::encode::operation_preimage(&op);
+
+    // A signature this verifier produces is low-s.
+    let low = v.sign(&sk, &msg);
+    assert!(v.verify_signature(&pk, &low, &msg));
+
+    // Flip s to N - s (still a valid ECDSA signature mathematically) and confirm rejection.
+    let mut bytes = [0u8; 64];
+    bytes.copy_from_slice(&low.0);
+    let s = bitcoin::secp256k1::SecretKey::from_slice(&bytes[32..64]).unwrap();
+    let s_high = s.negate();
+    bytes[32..64].copy_from_slice(&s_high.secret_bytes());
+    let high = Signature(bytes.to_vec());
+
+    assert!(!v.verify_signature(&pk, &high, &msg), "high-s signature must be rejected");
 }

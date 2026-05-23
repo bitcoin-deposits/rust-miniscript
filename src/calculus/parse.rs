@@ -20,6 +20,7 @@ use crate::prelude::*;
 use crate::MiniscriptKey;
 
 use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::encode::is_canonical_name;
 use super::limits::MAX_DEPTH;
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
 use super::schema::Schema;
@@ -160,6 +161,23 @@ fn lex(s: &str) -> Result<Vec<Tok>, ParseError> {
                 out.push(Tok::Colon);
                 i += 1;
             }
+            '-' => {
+                // A `-` is only meaningful as the sign of a numeric literal; require a digit next.
+                if i + 1 < bytes.len() && (bytes[i + 1] as char).is_ascii_digit() {
+                    let start = i;
+                    i += 1; // consume the `-`
+                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                        i += 1;
+                    }
+                    let text = &s[start..i];
+                    let n: i128 = text
+                        .parse()
+                        .map_err(|_| ParseError { message: format!("bad integer `{}`", text) })?;
+                    out.push(Tok::Num(n));
+                } else {
+                    return err(format!("unexpected character `-`"));
+                }
+            }
             '<' => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     out.push(Tok::Le);
@@ -260,6 +278,9 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 let name = self.word()?;
+                if !is_canonical_name(&name) {
+                    return err(format!("invalid constant name `{}`", name));
+                }
                 self.expect(&Tok::Eq)?;
                 let value = self.literal()?;
                 constants.insert(name, value);
@@ -326,8 +347,11 @@ impl<'a> Parser<'a> {
                     return Ok(Value::Hash(hash_literal(&w, &hexword)?));
                 }
                 self.pos += 1;
-                // bytes literal: `0x...`
+                // bytes literal: `0x...` (non-empty).
                 if let Some(hex) = w.strip_prefix("0x") {
+                    if hex.is_empty() {
+                        return err("empty hex literal `0x`");
+                    }
                     return Ok(Value::Bytes(decode_hex(hex)?));
                 }
                 match Pk::from_str(&w) {
@@ -560,9 +584,12 @@ impl<'a> Parser<'a> {
                     let hexword = self.word()?;
                     return Ok(VTerm::Lit(Value::Hash(hash_literal(&w, &hexword)?)));
                 }
-                // bytes literal: `0x...`
+                // bytes literal: `0x...` (non-empty).
                 if let Some(hex) = w.strip_prefix("0x") {
                     self.pos += 1;
+                    if hex.is_empty() {
+                        return err("empty hex literal `0x`");
+                    }
                     return Ok(VTerm::Lit(Value::Bytes(decode_hex(hex)?)));
                 }
                 // A word followed by `(` is a value-function application; otherwise it is a
