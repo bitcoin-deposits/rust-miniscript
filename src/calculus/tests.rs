@@ -1522,14 +1522,24 @@ mod polarity_exhaustiveness {
 }
 
 mod roundtrip_properties {
+    //! Generators cover every BTerm head constructor (and/or/thresh/not/if/match/cmp/state/prove
+    //! /const), every Obligation form (pk/pk_h/pk_any/pk_threshold/hashlock/attest), every CmpOp,
+    //! a broad swath of state predicates and value functions, and — for the bytes roundtrip —
+    //! every Value variant (int/key/hash/bytes/path/list/symbol/subtree).
+    //!
+    //! The source generator restricts a few shapes that have no source-literal form (Path/Subtree
+    //! /Symbol as `Lit`, OperationArg with non-symbol args): they exist at runtime via `path()`,
+    //! `ast_ref(...)`, `operation_type()`, and `operation_arg(name)`, but cannot be written as
+    //! literals. The bytes encoder handles them all.
     use super::*;
     use crate::calculus::admission::admit;
     use crate::calculus::ast::{BTerm, Descriptor, Obligation, VTerm};
     use crate::calculus::capability::CapabilitySet;
     use crate::calculus::encode::{decode_descriptor, encode_descriptor, to_string};
-    use crate::calculus::registry::StatePred;
+    use crate::calculus::registry::{CmpOp, StatePred, ValueFn};
+    use crate::calculus::schema::Schema;
 
-    /// A tiny PRNG, deterministic across runs, used by the generators below.
+    /// A tiny PRNG, deterministic across runs.
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -1537,85 +1547,315 @@ mod roundtrip_properties {
             self.0 >> 33
         }
         fn below(&mut self, n: u64) -> u64 { self.next() % n }
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len() as u64) as usize]
+        }
     }
 
-    const KEYS: [&str; 4] = ["a", "b", "c", "d"];
+    /// Constant names available for `with(...)` bindings and `Var` references. All match
+    /// `is_canonical_name`.
+    const NAMES: [&str; 4] = ["a", "b", "c", "d"];
+    /// String-key values usable as `Value::Key` literals (distinct from NAMES so the parser's
+    /// bound-vs-key disambiguation is exercised).
+    const KEYS: [&str; 4] = ["k_one", "k_two", "k_three", "k_four"];
 
-    fn leaf(rng: &mut Rng) -> BTerm<Pk> {
+    fn random_hash(rng: &mut Rng) -> HashValue {
+        let mut b32 = [0u8; 32];
+        for x in &mut b32 {
+            *x = rng.next() as u8;
+        }
+        let mut b20 = [0u8; 20];
+        for x in &mut b20 {
+            *x = rng.next() as u8;
+        }
         match rng.below(4) {
-            0 => BTerm::Prove(Obligation::Pk(VTerm::Lit(Value::Key(
-                KEYS[rng.below(4) as usize].to_string(),
-            )))),
-            1 => BTerm::Const(true),
-            2 => BTerm::Const(false),
-            _ => BTerm::State(StatePred::BalanceAtLeast, vec![VTerm::Lit(Value::Int(0))]),
+            0 => HashValue::Sha256(b32),
+            1 => HashValue::Hash256(b32),
+            2 => HashValue::Ripemd160(b20),
+            _ => HashValue::Hash160(b20),
+        }
+    }
+    fn random_bytes(rng: &mut Rng) -> Vec<u8> {
+        let n = (rng.below(16) + 1) as usize;
+        (0..n).map(|_| rng.next() as u8).collect()
+    }
+    fn random_int(rng: &mut Rng) -> i128 {
+        let lo = rng.next() as i128;
+        let hi = (rng.next() as i128) << 64;
+        lo ^ hi
+    }
+    fn random_symbol(rng: &mut Rng) -> Symbol { Symbol::new(*rng.pick(&NAMES)) }
+
+    /// A Value usable as a source-form literal: only the variants the parser accepts in literal
+    /// position. Excludes Path, Symbol, Subtree (no source form).
+    fn src_value(d: u32, rng: &mut Rng) -> Value<Pk> {
+        if d == 0 || rng.below(4) > 0 {
+            match rng.below(4) {
+                0 => Value::Int(random_int(rng)),
+                1 => Value::Key(rng.pick(&KEYS).to_string()),
+                2 => Value::Bytes(random_bytes(rng)),
+                _ => Value::Hash(random_hash(rng)),
+            }
+        } else {
+            let n = (rng.below(3) + 1) as usize;
+            Value::List((0..n).map(|_| src_value(d - 1, rng)).collect())
         }
     }
 
-    fn gen(d: u32, rng: &mut Rng) -> BTerm<Pk> {
+    /// A Value with the full range of variants — fine for the bytes roundtrip, not for source.
+    fn any_value(d: u32, rng: &mut Rng) -> Value<Pk> {
+        if d == 0 || rng.below(3) > 0 {
+            match rng.below(8) {
+                0 => Value::Int(random_int(rng)),
+                1 => Value::Key(rng.pick(&KEYS).to_string()),
+                2 => Value::Bytes(random_bytes(rng)),
+                3 => Value::Hash(random_hash(rng)),
+                4 => Value::Symbol(random_symbol(rng)),
+                5 => {
+                    let n = (rng.below(4)) as usize;
+                    Value::Path((0..n).map(|_| (rng.below(8)) as usize).collect())
+                }
+                6 => Value::Subtree(Box::new(BTerm::Const(rng.below(2) == 1))),
+                _ => Value::Int(0),
+            }
+        } else {
+            let n = (rng.below(3) + 1) as usize;
+            Value::List((0..n).map(|_| any_value(d - 1, rng)).collect())
+        }
+    }
+
+    fn gen_vterm(d: u32, rng: &mut Rng, for_source: bool) -> VTerm<Pk> {
         if d == 0 {
-            return leaf(rng);
+            return match rng.below(3) {
+                0 => VTerm::Lit(if for_source { src_value(0, rng) } else { any_value(0, rng) }),
+                1 => VTerm::Var(rng.pick(&NAMES).to_string()),
+                _ => VTerm::Lit(Value::Int(random_int(rng))),
+            };
         }
-        let kids = |d, rng: &mut Rng| -> Vec<BTerm<Pk>> {
-            let n = 2 + rng.below(2);
-            (0..n).map(|_| gen(d, rng)).collect()
-        };
-        match rng.below(7) {
-            0 => BTerm::And(kids(d - 1, rng)),
-            1 => BTerm::Or(kids(d - 1, rng)),
-            2 => BTerm::Thresh(rng.below(4) as usize, kids(d - 1, rng)),
-            3 => BTerm::Not(Box::new(gen(d - 1, rng))),
-            4 => BTerm::If(
-                Box::new(gen(d - 1, rng)),
-                Box::new(gen(d - 1, rng)),
-                Box::new(gen(d - 1, rng)),
+        match rng.below(6) {
+            0 => VTerm::Lit(if for_source { src_value(1, rng) } else { any_value(1, rng) }),
+            1 => VTerm::Var(rng.pick(&NAMES).to_string()),
+            2 => {
+                // A roundtrip-safe value function. OperationArg is special and goes in its own
+                // arm below, since the printer/parser expect a single bare-word symbol argument.
+                static SAFE: &[ValueFn] = &[
+                    ValueFn::Add,
+                    ValueFn::Sub,
+                    ValueFn::Mul,
+                    ValueFn::Div,
+                    ValueFn::Min,
+                    ValueFn::Max,
+                    ValueFn::Pct,
+                    ValueFn::Bps,
+                    ValueFn::OperationType,
+                    ValueFn::OperationPath,
+                    ValueFn::OperationSubtree,
+                    ValueFn::BlocksSinceActivity,
+                    ValueFn::BlocksSinceOpen,
+                    ValueFn::BlocksSinceReceived,
+                    ValueFn::DepositBalance,
+                    ValueFn::Path,
+                    ValueFn::AstRef,
+                    ValueFn::AstShapeAt,
+                    ValueFn::RollingWindow,
+                    ValueFn::CumulativeSpentVia,
+                ];
+                let f = *rng.pick(SAFE);
+                let n = match f {
+                    ValueFn::OperationType
+                    | ValueFn::OperationPath
+                    | ValueFn::OperationSubtree
+                    | ValueFn::BlocksSinceActivity
+                    | ValueFn::BlocksSinceOpen
+                    | ValueFn::BlocksSinceReceived
+                    | ValueFn::DepositBalance => 0,
+                    _ => (rng.below(3)) as usize,
+                };
+                VTerm::Op(f, (0..n).map(|_| gen_vterm(d - 1, rng, for_source)).collect())
+            }
+            3 => VTerm::Op(
+                ValueFn::OperationArg,
+                vec![VTerm::Lit(Value::Symbol(random_symbol(rng)))],
             ),
-            _ => leaf(rng),
+            _ => VTerm::Var(rng.pick(&NAMES).to_string()),
         }
     }
 
-    /// For every admitted descriptor, encoding then decoding reproduces the same descriptor and
-    /// the same canonical bytes. Surfaces any asymmetry between encoder and decoder.
+    fn gen_obl(d: u32, rng: &mut Rng, for_source: bool) -> Obligation<Pk> {
+        match rng.below(6) {
+            0 => Obligation::Pk(gen_vterm(d, rng, for_source)),
+            1 => Obligation::PkH(gen_vterm(d, rng, for_source)),
+            2 => Obligation::PkAny(gen_vterm(d, rng, for_source)),
+            3 => Obligation::PkThreshold(rng.below(4) as usize, gen_vterm(d, rng, for_source)),
+            4 => Obligation::Hashlock(gen_vterm(d, rng, for_source)),
+            _ => Obligation::Attest(
+                gen_vterm(d, rng, for_source),
+                Schema::PriceWithinBps { tolerance_bps: (rng.below(10000)) as u32 },
+            ),
+        }
+    }
+
+    fn cmp_op(rng: &mut Rng) -> CmpOp {
+        match rng.below(5) {
+            0 => CmpOp::Eq,
+            1 => CmpOp::Lt,
+            2 => CmpOp::Le,
+            3 => CmpOp::Gt,
+            _ => CmpOp::Ge,
+        }
+    }
+
+    /// State predicate with its argument count. Admission does not check arg counts, so the codec
+    /// roundtrips regardless of arg shape.
+    fn state_pred(rng: &mut Rng) -> (StatePred, usize) {
+        const PREDS: &[(StatePred, usize)] = &[
+            (StatePred::BalanceAtLeast, 1),
+            (StatePred::BalanceAtMost, 1),
+            (StatePred::Older, 1),
+            (StatePred::After, 1),
+            (StatePred::AmountAtMost, 1),
+            (StatePred::AmountAtMostPct, 1),
+            (StatePred::AmountInRange, 2),
+            (StatePred::DestinationIs, 1),
+            (StatePred::DestinationIn, 1),
+            (StatePred::BlocksSinceActivityAtLeast, 1),
+            (StatePred::BlocksSinceOpenBelow, 1),
+            (StatePred::BlocksSinceOpenAtLeast, 1),
+            (StatePred::BlocksSinceReceivedAtLeast, 1),
+            (StatePred::RollingAmountBelow, 2),
+            (StatePred::RollingAmountBelowPct, 2),
+            (StatePred::SubtreeAt, 2),
+        ];
+        *rng.pick(PREDS)
+    }
+
+    fn gen_bterm(d: u32, rng: &mut Rng, for_source: bool) -> BTerm<Pk> {
+        if d == 0 {
+            return match rng.below(6) {
+                0 => BTerm::Const(rng.below(2) == 1),
+                1 => BTerm::Prove(gen_obl(0, rng, for_source)),
+                2 => BTerm::Cmp(
+                    cmp_op(rng),
+                    gen_vterm(0, rng, for_source),
+                    gen_vterm(0, rng, for_source),
+                ),
+                3 => {
+                    let (p, n) = state_pred(rng);
+                    BTerm::State(p, (0..n).map(|_| gen_vterm(0, rng, for_source)).collect())
+                }
+                _ => BTerm::Const(false),
+            };
+        }
+        match rng.below(11) {
+            0 => BTerm::And(
+                (0..(2 + rng.below(2))).map(|_| gen_bterm(d - 1, rng, for_source)).collect(),
+            ),
+            1 => BTerm::Or(
+                (0..(2 + rng.below(2))).map(|_| gen_bterm(d - 1, rng, for_source)).collect(),
+            ),
+            2 => BTerm::Thresh(
+                rng.below(4) as usize,
+                (0..(2 + rng.below(2))).map(|_| gen_bterm(d - 1, rng, for_source)).collect(),
+            ),
+            3 => BTerm::Not(Box::new(gen_bterm(d - 1, rng, for_source))),
+            4 => BTerm::If(
+                Box::new(gen_bterm(d - 1, rng, for_source)),
+                Box::new(gen_bterm(d - 1, rng, for_source)),
+                Box::new(gen_bterm(d - 1, rng, for_source)),
+            ),
+            5 => {
+                let n = (rng.below(3) + 1) as usize;
+                BTerm::Match {
+                    scrutinee: gen_vterm(d - 1, rng, for_source),
+                    arms: (0..n)
+                        .map(|_| (random_symbol(rng), gen_bterm(d - 1, rng, for_source)))
+                        .collect(),
+                    default: Box::new(gen_bterm(d - 1, rng, for_source)),
+                }
+            }
+            6 => BTerm::Prove(gen_obl(d - 1, rng, for_source)),
+            7 => BTerm::Cmp(
+                cmp_op(rng),
+                gen_vterm(d - 1, rng, for_source),
+                gen_vterm(d - 1, rng, for_source),
+            ),
+            8 => {
+                let (p, n) = state_pred(rng);
+                BTerm::State(p, (0..n).map(|_| gen_vterm(d - 1, rng, for_source)).collect())
+            }
+            _ => gen_bterm(0, rng, for_source),
+        }
+    }
+
+    fn gen_descriptor(d: u32, rng: &mut Rng, for_source: bool) -> Descriptor<Pk> {
+        let mut constants = BTreeMap::new();
+        for name in NAMES {
+            let v = if for_source { src_value(2, rng) } else { any_value(2, rng) };
+            constants.insert(name.to_string(), v);
+        }
+        Descriptor { constants, body: gen_bterm(d, rng, for_source) }
+    }
+
+    /// Record every BTerm head constructor encountered, so the test can assert it actually
+    /// exercised a cross-section of the AST rather than degenerating to a few shapes.
+    fn note_shapes(seen: &mut BTreeSet<&'static str>, t: &BTerm<Pk>) {
+        seen.insert(t.shape());
+        for c in t.children() {
+            note_shapes(seen, c);
+        }
+    }
+
+    /// The BTerm head constructors the tests assert appear in every run.
+    const CORE_SHAPES: &[&str] = &[
+        "true", "false", "and", "or", "thresh", "not", "if", "match", "cmp",
+    ];
+
     #[test]
     fn bytes_roundtrip_for_admitted_terms() {
         let mut rng = Rng(0xDEAD_BEEF_CAFE_BABE);
         let caps = CapabilitySet::everything();
         let mut admitted = 0u32;
-        for _ in 0..300 {
-            let body = gen(4, &mut rng);
-            let d = Descriptor { constants: BTreeMap::new(), body };
+        let mut shapes: BTreeSet<&'static str> = BTreeSet::new();
+        for _ in 0..500 {
+            let d = gen_descriptor(4, &mut rng, false);
             if admit(&d, &caps).is_err() {
                 continue;
             }
             admitted += 1;
+            note_shapes(&mut shapes, &d.body);
             let bytes = encode_descriptor(&d);
             let back = decode_descriptor::<Pk>(&bytes).expect("decode");
             assert_eq!(d, back, "decode produced a different descriptor");
             assert_eq!(bytes, encode_descriptor(&back), "re-encoding diverged");
         }
-        assert!(admitted > 20, "too few admitted terms ({}); test is near-vacuous", admitted);
+        assert!(admitted > 50, "too few admitted ({}); test is near-vacuous", admitted);
+        for shape in CORE_SHAPES {
+            assert!(shapes.contains(shape), "no `{}` exercised; expand the generator", shape);
+        }
     }
 
-    /// For every admitted descriptor, printing to canonical source then re-parsing reproduces the
-    /// same descriptor. Surfaces any asymmetry between the source-form encoder and the parser.
     #[test]
     fn source_roundtrip_for_admitted_terms() {
         let mut rng = Rng(0x1234_5678_90AB_CDEF);
         let caps = CapabilitySet::everything();
         let mut admitted = 0u32;
-        for _ in 0..300 {
-            let body = gen(4, &mut rng);
-            let d = Descriptor { constants: BTreeMap::new(), body };
+        let mut shapes: BTreeSet<&'static str> = BTreeSet::new();
+        for _ in 0..500 {
+            let d = gen_descriptor(4, &mut rng, true);
             if admit(&d, &caps).is_err() {
                 continue;
             }
             admitted += 1;
+            note_shapes(&mut shapes, &d.body);
             let printed = to_string(&d);
             let back = parse::<Pk>(&printed)
                 .unwrap_or_else(|e| panic!("re-parse failed for `{}`: {}", printed, e));
             assert_eq!(d, back, "source roundtrip mismatch for `{}`", printed);
         }
-        assert!(admitted > 20, "too few admitted terms ({}); test is near-vacuous", admitted);
+        assert!(admitted > 50, "too few admitted ({}); test is near-vacuous", admitted);
+        for shape in CORE_SHAPES {
+            assert!(shapes.contains(shape), "no `{}` exercised; expand the generator", shape);
+        }
     }
 }
 
