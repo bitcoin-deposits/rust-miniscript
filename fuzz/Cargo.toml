@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 honggfuzz = { version = "0.5.55", default-features = false }
-miniscript = { path = "..", features = [ "compiler" ] }
+miniscript = { path = "..", features = [ "compiler", "dep16" ] }
 
 regex = "1.0"
 
@@ -46,3 +46,15 @@ path = "fuzz_targets/roundtrip_miniscript_str.rs"
 [[bin]]
 name = "roundtrip_semantic"
 path = "fuzz_targets/roundtrip_semantic.rs"
+
+[[bin]]
+name = "dep16_parse"
+path = "fuzz_targets/dep16_parse.rs"
+
+[[bin]]
+name = "dep16_decode_descriptor"
+path = "fuzz_targets/dep16_decode_descriptor.rs"
+
+[[bin]]
+name = "dep16_decode_fraud_proof"
+path = "fuzz_targets/dep16_decode_fraud_proof.rs"

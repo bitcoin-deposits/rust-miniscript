@@ -50,6 +50,11 @@ impl CanonicalKey for bitcoin::PublicKey {
     }
 }
 
+impl CanonicalKey for String {
+    fn to_canonical_bytes(&self) -> Vec<u8> { self.as_bytes().to_vec() }
+    fn from_canonical_bytes(bytes: &[u8]) -> Option<Self> { String::from_utf8(bytes.to_vec()).ok() }
+}
+
 impl CanonicalKey for bitcoin::secp256k1::XOnlyPublicKey {
     fn to_canonical_bytes(&self) -> Vec<u8> { self.serialize().to_vec() }
 

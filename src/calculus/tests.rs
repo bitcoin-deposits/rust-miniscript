@@ -4,7 +4,7 @@
 
 use crate::prelude::*;
 
-use super::encode::{operation_preimage, CanonicalKey};
+use super::encode::operation_preimage;
 use super::eval::{eval_b, evaluate};
 use super::host::{LedgerState, Operation};
 use super::parse::parse;
@@ -14,11 +14,6 @@ use super::value::{HashValue, Value};
 use super::witness::Witness;
 
 type Pk = String;
-
-impl CanonicalKey for String {
-    fn to_canonical_bytes(&self) -> Vec<u8> { self.as_bytes().to_vec() }
-    fn from_canonical_bytes(bytes: &[u8]) -> Option<Self> { String::from_utf8(bytes.to_vec()).ok() }
-}
 
 /// The mock signature scheme used throughout the tests: a valid signature by `key` over `msg` is
 /// the bytes `key | "|" | msg`. This binds a signature to both the key and the exact operation
@@ -1522,6 +1517,163 @@ mod polarity_exhaustiveness {
                 "expected reject for {:?}",
                 term,
             );
+        }
+    }
+}
+
+mod roundtrip_properties {
+    use super::*;
+    use crate::calculus::admission::admit;
+    use crate::calculus::ast::{BTerm, Descriptor, Obligation, VTerm};
+    use crate::calculus::capability::CapabilitySet;
+    use crate::calculus::encode::{decode_descriptor, encode_descriptor, to_string};
+    use crate::calculus::registry::StatePred;
+
+    /// A tiny PRNG, deterministic across runs, used by the generators below.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    const KEYS: [&str; 4] = ["a", "b", "c", "d"];
+
+    fn leaf(rng: &mut Rng) -> BTerm<Pk> {
+        match rng.below(4) {
+            0 => BTerm::Prove(Obligation::Pk(VTerm::Lit(Value::Key(
+                KEYS[rng.below(4) as usize].to_string(),
+            )))),
+            1 => BTerm::Const(true),
+            2 => BTerm::Const(false),
+            _ => BTerm::State(StatePred::BalanceAtLeast, vec![VTerm::Lit(Value::Int(0))]),
+        }
+    }
+
+    fn gen(d: u32, rng: &mut Rng) -> BTerm<Pk> {
+        if d == 0 {
+            return leaf(rng);
+        }
+        let kids = |d, rng: &mut Rng| -> Vec<BTerm<Pk>> {
+            let n = 2 + rng.below(2);
+            (0..n).map(|_| gen(d, rng)).collect()
+        };
+        match rng.below(7) {
+            0 => BTerm::And(kids(d - 1, rng)),
+            1 => BTerm::Or(kids(d - 1, rng)),
+            2 => BTerm::Thresh(rng.below(4) as usize, kids(d - 1, rng)),
+            3 => BTerm::Not(Box::new(gen(d - 1, rng))),
+            4 => BTerm::If(
+                Box::new(gen(d - 1, rng)),
+                Box::new(gen(d - 1, rng)),
+                Box::new(gen(d - 1, rng)),
+            ),
+            _ => leaf(rng),
+        }
+    }
+
+    /// For every admitted descriptor, encoding then decoding reproduces the same descriptor and
+    /// the same canonical bytes. Surfaces any asymmetry between encoder and decoder.
+    #[test]
+    fn bytes_roundtrip_for_admitted_terms() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_BABE);
+        let caps = CapabilitySet::everything();
+        let mut admitted = 0u32;
+        for _ in 0..300 {
+            let body = gen(4, &mut rng);
+            let d = Descriptor { constants: BTreeMap::new(), body };
+            if admit(&d, &caps).is_err() {
+                continue;
+            }
+            admitted += 1;
+            let bytes = encode_descriptor(&d);
+            let back = decode_descriptor::<Pk>(&bytes).expect("decode");
+            assert_eq!(d, back, "decode produced a different descriptor");
+            assert_eq!(bytes, encode_descriptor(&back), "re-encoding diverged");
+        }
+        assert!(admitted > 20, "too few admitted terms ({}); test is near-vacuous", admitted);
+    }
+
+    /// For every admitted descriptor, printing to canonical source then re-parsing reproduces the
+    /// same descriptor. Surfaces any asymmetry between the source-form encoder and the parser.
+    #[test]
+    fn source_roundtrip_for_admitted_terms() {
+        let mut rng = Rng(0x1234_5678_90AB_CDEF);
+        let caps = CapabilitySet::everything();
+        let mut admitted = 0u32;
+        for _ in 0..300 {
+            let body = gen(4, &mut rng);
+            let d = Descriptor { constants: BTreeMap::new(), body };
+            if admit(&d, &caps).is_err() {
+                continue;
+            }
+            admitted += 1;
+            let printed = to_string(&d);
+            let back = parse::<Pk>(&printed)
+                .unwrap_or_else(|e| panic!("re-parse failed for `{}`: {}", printed, e));
+            assert_eq!(d, back, "source roundtrip mismatch for `{}`", printed);
+        }
+        assert!(admitted > 20, "too few admitted terms ({}); test is near-vacuous", admitted);
+    }
+}
+
+mod fuzz_smoke {
+    //! Smoke tests for the fuzz entry points: a handful of hostile byte strings should not panic
+    //! and should produce an error. Each target file under `fuzz/fuzz_targets/` calls the same
+    //! library function this exercises.
+    use super::*;
+    use crate::calculus::encode::decode_descriptor;
+    use crate::calculus::fraud::FraudProof;
+
+    fn samples() -> Vec<Vec<u8>> {
+        vec![
+            vec![],
+            vec![0],
+            vec![0xff; 1024],
+            (0..256).map(|i| i as u8).collect(),
+            // Mostly-valid descriptor prefix with a giant length.
+            {
+                let mut v = vec![0x01];
+                v.extend_from_slice(&u32::MAX.to_be_bytes());
+                v
+            },
+        ]
+    }
+
+    #[test]
+    fn parse_does_not_panic_on_hostile_input() {
+        for data in samples() {
+            if let Ok(s) = std::str::from_utf8(&data) {
+                let _ = parse::<Pk>(s);
+            }
+        }
+        // Plus some deliberate strings.
+        for s in [
+            "",
+            "(",
+            "with(",
+            "0x",
+            "not(",
+            "and()",
+            "match(operation_type(),)",
+        ] {
+            let _ = parse::<Pk>(s);
+        }
+    }
+
+    #[test]
+    fn decode_descriptor_does_not_panic_on_hostile_input() {
+        for data in samples() {
+            let _ = decode_descriptor::<Pk>(&data);
+        }
+    }
+
+    #[test]
+    fn decode_fraud_proof_does_not_panic_on_hostile_input() {
+        for data in samples() {
+            let _ = FraudProof::<Pk>::decode(&data);
         }
     }
 }
