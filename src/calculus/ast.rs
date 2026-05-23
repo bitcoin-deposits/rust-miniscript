@@ -75,6 +75,12 @@ pub enum Obligation<Pk: MiniscriptKey> {
     /// A preimage of a hash is revealed.
     Hashlock(VTerm<Pk>),
     /// An oracle attestation matching a schema is supplied.
+    ///
+    /// **SECURITY — deferred:** the verifier for `attest` in this crate checks only that the
+    /// witness's `attestations` set contains the oracle key, **not** that any real signed
+    /// attestation matches the schema. Real oracle-signature + schema verification belongs to the
+    /// attestation/oracle dep, which is not implemented here. Do not deploy a verifier that relies
+    /// on this obligation until that dep lands.
     Attest(VTerm<Pk>, Schema),
 }
 

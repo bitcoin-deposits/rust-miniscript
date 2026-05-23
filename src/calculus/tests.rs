@@ -1425,3 +1425,103 @@ mod parser_edges {
         assert!(matches!(d2.body, BTerm::Cmp(_, _, _)));
     }
 }
+
+mod polarity_exhaustiveness {
+    use super::*;
+    use crate::calculus::admission::{check_polarity, AdmissionError};
+    use crate::calculus::ast::{BTerm, Obligation, VTerm};
+    use crate::calculus::registry::{CmpOp, StatePred, Symbol, ValueFn};
+
+    fn pk() -> BTerm<Pk> {
+        BTerm::Prove(Obligation::Pk(VTerm::Lit(Value::Key("K".to_string()))))
+    }
+    fn t() -> BTerm<Pk> { BTerm::Const(true) }
+    fn f() -> BTerm<Pk> { BTerm::Const(false) }
+    fn op_type_v() -> VTerm<Pk> { VTerm::Op(ValueFn::OperationType, vec![]) }
+    fn state_t() -> BTerm<Pk> {
+        BTerm::State(StatePred::BalanceAtLeast, vec![VTerm::Lit(Value::Int(0))])
+    }
+    fn cmp_t() -> BTerm<Pk> {
+        BTerm::Cmp(CmpOp::Eq, VTerm::Lit(Value::Int(0)), VTerm::Lit(Value::Int(0)))
+    }
+
+    /// Compile-time exhaustiveness: if a new `BTerm` variant (or B-child slot) is added without
+    /// classifying its polarity behavior in this module, this match stops compiling and forces an
+    /// explicit decision. This is the safety net that catches a silent polarity-rule regression.
+    #[allow(dead_code)]
+    fn _classify_every_variant(t: &BTerm<Pk>) {
+        match t {
+            // No B-child slots — nothing to admit a proof obligation into.
+            BTerm::Const(_) | BTerm::Cmp(_, _, _) | BTerm::State(_, _) | BTerm::Prove(_) => {}
+            // All B-children are positive.
+            BTerm::And(_) | BTerm::Or(_) | BTerm::Thresh(_, _) => {}
+            // Single negative B-child.
+            BTerm::Not(_) => {}
+            // condition: negative; then/else: positive.
+            BTerm::If(_, _, _) => {}
+            // arms[i].body: positive; default: positive; scrutinee is sort V (no Prove possible).
+            BTerm::Match { .. } => {}
+        }
+    }
+
+    /// A `Prove` placed in every positive slot is admitted.
+    #[test]
+    fn positive_slots_admit() {
+        let positives: Vec<BTerm<Pk>> = vec![
+            BTerm::And(vec![pk(), t()]),
+            BTerm::Or(vec![pk(), f()]),
+            BTerm::Thresh(1, vec![pk(), f()]),
+            BTerm::If(Box::new(state_t()), Box::new(pk()), Box::new(f())),
+            BTerm::If(Box::new(state_t()), Box::new(t()), Box::new(pk())),
+            BTerm::Match {
+                scrutinee: op_type_v(),
+                arms: vec![(Symbol::new("spend"), pk())],
+                default: Box::new(f()),
+            },
+            BTerm::Match {
+                scrutinee: op_type_v(),
+                arms: vec![(Symbol::new("spend"), t())],
+                default: Box::new(pk()),
+            },
+        ];
+        for term in &positives {
+            assert_eq!(
+                check_polarity(term, true),
+                Ok(()),
+                "expected admit for {:?}",
+                term,
+            );
+        }
+    }
+
+    /// A `Prove` placed in any negative slot is rejected, including when wrapped by intervening
+    /// positive containers.
+    #[test]
+    fn negative_slots_reject() {
+        let negatives: Vec<BTerm<Pk>> = vec![
+            // The two non-vacuous cases the rule names.
+            BTerm::Not(Box::new(pk())),
+            BTerm::If(Box::new(pk()), Box::new(t()), Box::new(f())),
+            // Negative position propagates through positive containers below `not`.
+            BTerm::Not(Box::new(BTerm::And(vec![pk(), t()]))),
+            BTerm::Or(vec![cmp_t(), BTerm::Not(Box::new(pk()))]),
+            // A Prove buried in an if-condition is rejected wherever it sits.
+            BTerm::If(Box::new(BTerm::And(vec![pk(), t()])), Box::new(t()), Box::new(f())),
+            BTerm::If(Box::new(BTerm::Or(vec![cmp_t(), pk()])), Box::new(t()), Box::new(f())),
+            // Match arm bodies are positive, but a Match inside a Not flips them.
+            BTerm::Not(Box::new(BTerm::Match {
+                scrutinee: op_type_v(),
+                arms: vec![(Symbol::new("spend"), pk())],
+                default: Box::new(f()),
+            })),
+        ];
+        for term in &negatives {
+            assert_eq!(
+                check_polarity(term, true),
+                Err(AdmissionError::NegativeProof),
+                "expected reject for {:?}",
+                term,
+            );
+        }
+    }
+}

@@ -400,6 +400,8 @@ where
                 None => false,
             })
         }
+        // SECURITY: deferred — attestor-presence check only, not real oracle-signature + schema
+        // verification. See the doc on `Obligation::Attest`.
         Obligation::Attest(key, _schema) => Ok(w.attestations.contains(&as_key(key)?)),
     }
 }
