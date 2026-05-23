@@ -17,6 +17,7 @@ use super::admission::{admit, AdmissionError};
 use super::ast::{BTerm, Descriptor};
 use super::capability::CapabilitySet;
 use super::host::Operation;
+use super::limits::MAX_DEPTH;
 
 /// A modification that cannot be applied to the term structure.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -31,6 +32,9 @@ pub enum ModifyError {
     NotAModification(String),
     /// A required operation argument was absent.
     MissingArg(&'static str),
+    /// The path exceeded [`MAX_DEPTH`](super::limits::MAX_DEPTH), so navigating it would recurse
+    /// further than the calculus permits.
+    PathTooDeep,
 }
 
 /// A modification rejected at admission time.
@@ -48,6 +52,9 @@ pub fn replace_at<Pk: MiniscriptKey>(
     path: &[usize],
     new: BTerm<Pk>,
 ) -> Result<BTerm<Pk>, ModifyError> {
+    if path.len() > MAX_DEPTH {
+        return Err(ModifyError::PathTooDeep);
+    }
     update_at(t, path, move |_| Ok(new))
 }
 
@@ -56,6 +63,9 @@ pub fn delete_at<Pk: MiniscriptKey>(
     t: &BTerm<Pk>,
     path: &[usize],
 ) -> Result<BTerm<Pk>, ModifyError> {
+    if path.len() > MAX_DEPTH {
+        return Err(ModifyError::PathTooDeep);
+    }
     let (idx, parent) = path.split_last().ok_or(ModifyError::EmptyPath)?;
     let idx = *idx;
     update_at(t, parent, move |c| remove_child(c, idx))
@@ -67,6 +77,9 @@ pub fn insert_at<Pk: MiniscriptKey>(
     path: &[usize],
     new: BTerm<Pk>,
 ) -> Result<BTerm<Pk>, ModifyError> {
+    if path.len() > MAX_DEPTH {
+        return Err(ModifyError::PathTooDeep);
+    }
     let (idx, parent) = path.split_last().ok_or(ModifyError::EmptyPath)?;
     let idx = *idx;
     update_at(t, parent, move |c| insert_child(c, idx, new))

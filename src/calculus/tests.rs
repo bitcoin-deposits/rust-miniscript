@@ -933,6 +933,7 @@ mod snapshot_codec {
         bytes.extend_from_slice(&0i128.to_be_bytes());
         bytes.extend_from_slice(&0u32.to_be_bytes()); // since_activity
         bytes.extend_from_slice(&0u32.to_be_bytes()); // since_open
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // since_received
         bytes.extend_from_slice(&0u32.to_be_bytes()); // height
         bytes.extend_from_slice(&2u32.to_be_bytes()); // 2 rolling entries
         // entry (field_id=1, period=0) then (field_id=0, period=0): decreasing -> rejected.
@@ -1316,5 +1317,82 @@ mod ledger_primitives {
             assert!(admit(&d, &CapabilitySet::everything()).is_ok());
             assert_eq!(d, decode_descriptor::<Pk>(&encode_descriptor(&d)).unwrap());
         }
+    }
+}
+
+mod hardening {
+    use super::*;
+    use crate::calculus::admission::{admit, AdmissionError};
+    use crate::calculus::ast::{BTerm, Descriptor};
+    use crate::calculus::capability::CapabilitySet;
+    use crate::calculus::encode::{decode_descriptor, DecodeError};
+    use crate::calculus::limits::MAX_DEPTH;
+    use crate::calculus::modify::{replace_at, ModifyError};
+
+    fn nest_not(n: usize) -> BTerm<Pk> {
+        let mut t: BTerm<Pk> = BTerm::Const(false);
+        for _ in 0..n {
+            t = BTerm::Not(Box::new(t));
+        }
+        t
+    }
+
+    #[test]
+    fn parser_rejects_overdeep_nesting() {
+        // A source string of `not(not(... not(false) ...))` past the depth limit.
+        let mut src = String::new();
+        for _ in 0..(MAX_DEPTH + 50) {
+            src.push_str("not(");
+        }
+        src.push_str("false");
+        for _ in 0..(MAX_DEPTH + 50) {
+            src.push(')');
+        }
+        let r = parse::<Pk>(&src);
+        assert!(r.is_err(), "expected parse to reject over-deep nesting");
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("nesting too deep"), "unexpected error: {}", msg);
+    }
+
+    #[test]
+    fn decoder_rejects_overdeep_nesting() {
+        // Bytes: version + 0 constants + (Not tag) * N + Const(false).
+        let mut bytes = vec![0x01u8, 0, 0, 0, 0]; // version + 0 constants
+        for _ in 0..(MAX_DEPTH + 50) {
+            bytes.push(0x04); // BTerm::Not tag
+        }
+        bytes.push(0x00); // BTerm::Const tag
+        bytes.push(0x00); // false
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::TooDeep));
+    }
+
+    #[test]
+    fn decoder_rejects_oversized_list_count() {
+        // version + constants count = u32::MAX, with no following bytes.
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::OversizedList));
+    }
+
+    #[test]
+    fn modify_rejects_overdeep_path() {
+        let body: BTerm<Pk> = BTerm::Const(true);
+        let path: Vec<usize> = (0..(MAX_DEPTH + 1)).collect();
+        assert_eq!(replace_at(&body, &path, BTerm::Const(false)), Err(ModifyError::PathTooDeep));
+    }
+
+    #[test]
+    fn admit_rejects_overdeep_term() {
+        let body = nest_not(MAX_DEPTH + 10);
+        let d: Descriptor<Pk> = Descriptor { constants: BTreeMap::new(), body };
+        assert_eq!(admit(&d, &CapabilitySet::everything()), Err(AdmissionError::TooDeep));
+    }
+
+    #[test]
+    fn admit_accepts_at_the_limit() {
+        // A term right at MAX_DEPTH should still admit (not under MAX_DEPTH + 1 levels of not).
+        let body = nest_not(MAX_DEPTH - 1); // depth = MAX_DEPTH (MAX_DEPTH - 1 nots + leaf)
+        let d: Descriptor<Pk> = Descriptor { constants: BTreeMap::new(), body };
+        assert!(admit(&d, &CapabilitySet::everything()).is_ok());
     }
 }

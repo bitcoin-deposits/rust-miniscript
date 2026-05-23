@@ -21,6 +21,7 @@ use crate::prelude::*;
 
 use super::ast::{BTerm, Descriptor, Obligation, VTerm};
 use super::capability::CapabilitySet;
+use super::limits::MAX_DEPTH;
 use super::registry::{StatePred, ValueFn};
 use crate::MiniscriptKey;
 
@@ -38,6 +39,9 @@ pub enum AdmissionError {
     UncapableObligation(super::capability::ObligationKind),
     /// A `with(...)` reference that does not resolve to a bound constant.
     UnresolvedVar(String),
+    /// The descriptor's term exceeds [`MAX_DEPTH`](super::limits::MAX_DEPTH). Admitted descriptors
+    /// are therefore bounded by `MAX_DEPTH`, which downstream evaluators rely on.
+    TooDeep,
 }
 
 /// Run all admission checks on a descriptor against an operator's capability set.
@@ -45,6 +49,9 @@ pub fn admit<Pk: MiniscriptKey>(
     d: &Descriptor<Pk>,
     caps: &CapabilitySet,
 ) -> Result<(), AdmissionError> {
+    if !d.body.has_depth_at_most(MAX_DEPTH) {
+        return Err(AdmissionError::TooDeep);
+    }
     check_polarity(&d.body, true)?;
     check_b(&d.body, caps, &d.constants)?;
     Ok(())

@@ -20,6 +20,7 @@ use crate::MiniscriptKey;
 use super::ast::{BTerm, Descriptor, Obligation, VTerm};
 use super::fraud::FraudProof;
 use super::host::Operation;
+use super::limits::MAX_DEPTH;
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
 use super::schema::Schema;
 use super::signature::Signature;
@@ -589,7 +590,7 @@ pub fn decode_operation<Pk: MiniscriptKey + CanonicalKey>(
     let mut deposit_id = [0u8; 32];
     deposit_id.copy_from_slice(d.take(32)?);
     let op_type = Symbol::new(d.symbol()?);
-    let n = d.u32()?;
+    let n = d.list_count()?;
     let mut args = BTreeMap::new();
     let mut prev: Option<String> = None;
     for _ in 0..n {
@@ -602,7 +603,7 @@ pub fn decode_operation<Pk: MiniscriptKey + CanonicalKey>(
                 return Err(DecodeError::NonCanonicalOrder);
             }
         }
-        let value = dec_value(&mut d)?;
+        let value = dec_value(&mut d, 0)?;
         prev = Some(name.clone());
         args.insert(name, value);
     }
@@ -637,6 +638,11 @@ pub enum DecodeError {
     BadKey,
     /// A symbol or name that is not valid UTF-8.
     BadUtf8,
+    /// Nesting exceeded [`MAX_DEPTH`](super::limits::MAX_DEPTH).
+    TooDeep,
+    /// A list length that cannot fit in the remaining input even at the minimum byte per element;
+    /// stops an attacker count from driving a multi-gigabyte preallocation.
+    OversizedList,
 }
 
 struct Decoder<'a> {
@@ -704,6 +710,20 @@ impl<'a> Decoder<'a> {
         } else {
             Err(DecodeError::TrailingBytes)
         }
+    }
+
+    /// Bytes remaining in the input.
+    fn remaining(&self) -> usize { self.buf.len() - self.pos }
+
+    /// Read a `u32` list count and refuse it if it cannot possibly fit in the remaining input —
+    /// each list element costs at least one byte, so `n` greater than `remaining()` is always
+    /// pathological. This caps `Vec::with_capacity` against attacker counts.
+    fn list_count(&mut self) -> Result<usize, DecodeError> {
+        let n = self.u32()? as usize;
+        if n > self.remaining() {
+            return Err(DecodeError::OversizedList);
+        }
+        Ok(n)
     }
 }
 
@@ -793,7 +813,13 @@ fn dec_hash(d: &mut Decoder) -> Result<HashValue, DecodeError> {
     })
 }
 
-fn dec_value<Pk: MiniscriptKey + CanonicalKey>(d: &mut Decoder) -> Result<Value<Pk>, DecodeError> {
+fn dec_value<Pk: MiniscriptKey + CanonicalKey>(
+    d: &mut Decoder,
+    depth: usize,
+) -> Result<Value<Pk>, DecodeError> {
+    if depth > MAX_DEPTH {
+        return Err(DecodeError::TooDeep);
+    }
     Ok(match d.u8()? {
         0x00 => Value::Int(d.int()?),
         0x01 => {
@@ -803,92 +829,105 @@ fn dec_value<Pk: MiniscriptKey + CanonicalKey>(d: &mut Decoder) -> Result<Value<
         0x02 => Value::Hash(dec_hash(d)?),
         0x03 => Value::Bytes(d.bytes()?),
         0x04 => {
-            let n = d.u32()?;
-            let mut p = Vec::with_capacity(n as usize);
+            let n = d.list_count()?;
+            let mut p = Vec::with_capacity(n);
             for _ in 0..n {
                 p.push(d.u32()? as usize);
             }
             Value::Path(p)
         }
         0x05 => {
-            let n = d.u32()?;
-            let mut items = Vec::with_capacity(n as usize);
+            let n = d.list_count()?;
+            let mut items = Vec::with_capacity(n);
             for _ in 0..n {
-                items.push(dec_value(d)?);
+                items.push(dec_value(d, depth + 1)?);
             }
             Value::List(items)
         }
         0x06 => Value::Symbol(Symbol::new(d.symbol()?)),
-        0x07 => Value::Subtree(Box::new(dec_term(d)?)),
+        0x07 => Value::Subtree(Box::new(dec_term(d, depth + 1)?)),
         t => return Err(DecodeError::UnknownTag("value", t as u32)),
     })
 }
 
-fn dec_term<Pk: MiniscriptKey + CanonicalKey>(d: &mut Decoder) -> Result<BTerm<Pk>, DecodeError> {
+fn dec_term<Pk: MiniscriptKey + CanonicalKey>(
+    d: &mut Decoder,
+    depth: usize,
+) -> Result<BTerm<Pk>, DecodeError> {
+    if depth > MAX_DEPTH {
+        return Err(DecodeError::TooDeep);
+    }
     Ok(match d.u8()? {
         0x00 => BTerm::Const(d.boolean()?),
-        0x01 => BTerm::And(dec_term_list(d)?),
-        0x02 => BTerm::Or(dec_term_list(d)?),
+        0x01 => BTerm::And(dec_term_list(d, depth + 1)?),
+        0x02 => BTerm::Or(dec_term_list(d, depth + 1)?),
         0x03 => {
             let k = d.u32()? as usize;
-            BTerm::Thresh(k, dec_term_list(d)?)
+            BTerm::Thresh(k, dec_term_list(d, depth + 1)?)
         }
-        0x04 => BTerm::Not(Box::new(dec_term(d)?)),
+        0x04 => BTerm::Not(Box::new(dec_term(d, depth + 1)?)),
         0x05 => BTerm::If(
-            Box::new(dec_term(d)?),
-            Box::new(dec_term(d)?),
-            Box::new(dec_term(d)?),
+            Box::new(dec_term(d, depth + 1)?),
+            Box::new(dec_term(d, depth + 1)?),
+            Box::new(dec_term(d, depth + 1)?),
         ),
         0x06 => {
-            let scrutinee = dec_vterm(d)?;
-            let n = d.u32()?;
-            let mut arms = Vec::with_capacity(n as usize);
+            let scrutinee = dec_vterm(d, depth + 1)?;
+            let n = d.list_count()?;
+            let mut arms = Vec::with_capacity(n);
             for _ in 0..n {
                 let tag = Symbol::new(d.symbol()?);
-                arms.push((tag, dec_term(d)?));
+                arms.push((tag, dec_term(d, depth + 1)?));
             }
-            let default = Box::new(dec_term(d)?);
+            let default = Box::new(dec_term(d, depth + 1)?);
             BTerm::Match { scrutinee, arms, default }
         }
         0x07 => {
             let op = cmpop_from_id(d.u8()?)?;
-            BTerm::Cmp(op, dec_vterm(d)?, dec_vterm(d)?)
+            BTerm::Cmp(op, dec_vterm(d, depth + 1)?, dec_vterm(d, depth + 1)?)
         }
         0x08 => {
             let p = statepred_from_id(d.u16()?)?;
-            let n = d.u32()?;
-            let mut args = Vec::with_capacity(n as usize);
+            let n = d.list_count()?;
+            let mut args = Vec::with_capacity(n);
             for _ in 0..n {
-                args.push(dec_vterm(d)?);
+                args.push(dec_vterm(d, depth + 1)?);
             }
             BTerm::State(p, args)
         }
-        0x09 => BTerm::Prove(dec_obligation(d)?),
+        0x09 => BTerm::Prove(dec_obligation(d, depth)?),
         t => return Err(DecodeError::UnknownTag("node", t as u32)),
     })
 }
 
 fn dec_term_list<Pk: MiniscriptKey + CanonicalKey>(
     d: &mut Decoder,
+    depth: usize,
 ) -> Result<Vec<BTerm<Pk>>, DecodeError> {
-    let n = d.u32()?;
-    let mut out = Vec::with_capacity(n as usize);
+    let n = d.list_count()?;
+    let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        out.push(dec_term(d)?);
+        out.push(dec_term(d, depth)?);
     }
     Ok(out)
 }
 
-fn dec_vterm<Pk: MiniscriptKey + CanonicalKey>(d: &mut Decoder) -> Result<VTerm<Pk>, DecodeError> {
+fn dec_vterm<Pk: MiniscriptKey + CanonicalKey>(
+    d: &mut Decoder,
+    depth: usize,
+) -> Result<VTerm<Pk>, DecodeError> {
+    if depth > MAX_DEPTH {
+        return Err(DecodeError::TooDeep);
+    }
     Ok(match d.u8()? {
-        0x00 => VTerm::Lit(dec_value(d)?),
+        0x00 => VTerm::Lit(dec_value(d, depth + 1)?),
         0x01 => VTerm::Var(d.symbol()?),
         0x02 => {
             let f = valuefn_from_id(d.u16()?)?;
-            let n = d.u32()?;
-            let mut args = Vec::with_capacity(n as usize);
+            let n = d.list_count()?;
+            let mut args = Vec::with_capacity(n);
             for _ in 0..n {
-                args.push(dec_vterm(d)?);
+                args.push(dec_vterm(d, depth + 1)?);
             }
             VTerm::Op(f, args)
         }
@@ -898,18 +937,19 @@ fn dec_vterm<Pk: MiniscriptKey + CanonicalKey>(d: &mut Decoder) -> Result<VTerm<
 
 fn dec_obligation<Pk: MiniscriptKey + CanonicalKey>(
     d: &mut Decoder,
+    depth: usize,
 ) -> Result<Obligation<Pk>, DecodeError> {
     Ok(match d.u16()? {
-        0x0000 => Obligation::Pk(dec_vterm(d)?),
-        0x0001 => Obligation::PkH(dec_vterm(d)?),
-        0x0002 => Obligation::PkAny(dec_vterm(d)?),
+        0x0000 => Obligation::Pk(dec_vterm(d, depth + 1)?),
+        0x0001 => Obligation::PkH(dec_vterm(d, depth + 1)?),
+        0x0002 => Obligation::PkAny(dec_vterm(d, depth + 1)?),
         0x0003 => {
             let k = d.u32()? as usize;
-            Obligation::PkThreshold(k, dec_vterm(d)?)
+            Obligation::PkThreshold(k, dec_vterm(d, depth + 1)?)
         }
-        0x0004 => Obligation::Hashlock(dec_vterm(d)?),
+        0x0004 => Obligation::Hashlock(dec_vterm(d, depth + 1)?),
         0x0005 => {
-            let v = dec_vterm(d)?;
+            let v = dec_vterm(d, depth + 1)?;
             Obligation::Attest(v, dec_schema(d)?)
         }
         t => return Err(DecodeError::UnknownTag("obligation", t as u32)),
@@ -941,7 +981,7 @@ pub fn decode_descriptor<Pk: MiniscriptKey + CanonicalKey>(
     if version != 0x01 {
         return Err(DecodeError::BadVersion(version));
     }
-    let n = d.u32()?;
+    let n = d.list_count()?;
     let mut constants = BTreeMap::new();
     let mut prev: Option<String> = None;
     for _ in 0..n {
@@ -955,11 +995,11 @@ pub fn decode_descriptor<Pk: MiniscriptKey + CanonicalKey>(
                 return Err(DecodeError::NonCanonicalOrder);
             }
         }
-        let value = dec_value(&mut d)?;
+        let value = dec_value(&mut d, 0)?;
         prev = Some(name.clone());
         constants.insert(name, value);
     }
-    let body = dec_term(&mut d)?;
+    let body = dec_term(&mut d, 0)?;
     d.finish()?;
     Ok(Descriptor { constants, body })
 }
@@ -1041,7 +1081,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<super::snapshot::Snapshot, DecodeEr
     let height = d.u32()?;
 
     let mut rolling = BTreeMap::new();
-    let n = d.u32()?;
+    let n = d.list_count()?;
     let mut prev: Option<(u8, u32)> = None;
     for _ in 0..n {
         let field_id = d.u8()?;
@@ -1058,11 +1098,11 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<super::snapshot::Snapshot, DecodeEr
     }
 
     let mut cumulative_spent: BTreeMap<Vec<usize>, i128> = BTreeMap::new();
-    let m = d.u32()?;
+    let m = d.list_count()?;
     let mut prev_path: Option<Vec<usize>> = None;
     for _ in 0..m {
-        let plen = d.u32()?;
-        let mut path = Vec::with_capacity(plen as usize);
+        let plen = d.list_count()?;
+        let mut path = Vec::with_capacity(plen);
         for _ in 0..plen {
             path.push(d.u32()? as usize);
         }
@@ -1131,7 +1171,7 @@ pub fn decode_witness<Pk: MiniscriptKey + CanonicalKey>(
         return Err(DecodeError::BadVersion(buf.first().copied().unwrap_or(0)));
     }
     let mut signatures = BTreeMap::new();
-    let n = d.u32()?;
+    let n = d.list_count()?;
     let mut prev: Option<Vec<u8>> = None;
     for _ in 0..n {
         let kb = d.bytes()?;
@@ -1147,7 +1187,7 @@ pub fn decode_witness<Pk: MiniscriptKey + CanonicalKey>(
     }
 
     let mut preimages = BTreeMap::new();
-    let m = d.u32()?;
+    let m = d.list_count()?;
     let mut prev_h: Option<HashValue> = None;
     for _ in 0..m {
         let h = dec_hash(&mut d)?;
@@ -1162,7 +1202,7 @@ pub fn decode_witness<Pk: MiniscriptKey + CanonicalKey>(
     }
 
     let mut attestations = BTreeSet::new();
-    let a = d.u32()?;
+    let a = d.list_count()?;
     let mut prev_a: Option<Vec<u8>> = None;
     for _ in 0..a {
         let kb = d.bytes()?;

@@ -20,6 +20,7 @@ use crate::prelude::*;
 use crate::MiniscriptKey;
 
 use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::limits::MAX_DEPTH;
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
 use super::schema::Schema;
 use super::value::{HashValue, Value};
@@ -94,7 +95,7 @@ where
     Pk: MiniscriptKey + FromStr,
 {
     let tokens = lex(s)?;
-    let mut p = Parser { tokens: &tokens, pos: 0, bound: BTreeSet::new() };
+    let mut p = Parser { tokens: &tokens, pos: 0, bound: BTreeSet::new(), depth: 0 };
     let d = p.descriptor()?;
     if p.pos != p.tokens.len() {
         return err(format!("trailing tokens after descriptor at position {}", p.pos));
@@ -215,6 +216,9 @@ struct Parser<'a> {
     /// Names bound by the enclosing `with(...)`. A bare word in value position resolves to a
     /// constant reference if bound, and is otherwise parsed as a key literal.
     bound: BTreeSet<String>,
+    /// Current AST nesting depth, bounded by [`MAX_DEPTH`] to stop adversary-supplied input from
+    /// driving the recursive descent into a stack overflow.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -276,6 +280,19 @@ impl<'a> Parser<'a> {
     where
         Pk: MiniscriptKey + FromStr,
     {
+        if self.depth >= MAX_DEPTH {
+            return err(format!("nesting too deep (> {})", MAX_DEPTH));
+        }
+        self.depth += 1;
+        let r = self.literal_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn literal_inner<Pk>(&mut self) -> Result<Value<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
         match self.peek() {
             Some(Tok::LBracket) => {
                 self.pos += 1;
@@ -323,6 +340,19 @@ impl<'a> Parser<'a> {
     }
 
     fn bterm<Pk>(&mut self) -> Result<BTerm<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        if self.depth >= MAX_DEPTH {
+            return err(format!("nesting too deep (> {})", MAX_DEPTH));
+        }
+        self.depth += 1;
+        let r = self.bterm_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn bterm_inner<Pk>(&mut self) -> Result<BTerm<Pk>, ParseError>
     where
         Pk: MiniscriptKey + FromStr,
     {
@@ -498,6 +528,19 @@ impl<'a> Parser<'a> {
     }
 
     fn vterm<Pk>(&mut self) -> Result<VTerm<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        if self.depth >= MAX_DEPTH {
+            return err(format!("nesting too deep (> {})", MAX_DEPTH));
+        }
+        self.depth += 1;
+        let r = self.vterm_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn vterm_inner<Pk>(&mut self) -> Result<VTerm<Pk>, ParseError>
     where
         Pk: MiniscriptKey + FromStr,
     {

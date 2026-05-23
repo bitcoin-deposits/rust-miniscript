@@ -123,8 +123,21 @@ impl<Pk: MiniscriptKey> BTerm<Pk> {
     }
 
     /// The depth of this term's ast (a leaf has depth 1).
+    ///
+    /// Unbounded on input — callers that take adversary-supplied terms should use
+    /// [`has_depth_at_most`](BTerm::has_depth_at_most) instead, which early-exits.
     pub fn depth(&self) -> usize {
         1 + self.children().iter().map(|c| c.depth()).max().unwrap_or(0)
+    }
+
+    /// Whether this term's depth is at most `limit`. Early-exits without descending further than
+    /// `limit` levels, so it is safe to call on terms whose depth is not yet bounded.
+    pub fn has_depth_at_most(&self, limit: usize) -> bool {
+        if limit == 0 {
+            self.children().is_empty()
+        } else {
+            self.children().iter().all(|c| c.has_depth_at_most(limit - 1))
+        }
     }
 }
 

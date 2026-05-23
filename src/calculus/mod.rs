@@ -28,6 +28,7 @@ pub mod encode;
 pub mod eval;
 pub mod fraud;
 pub mod host;
+pub mod limits;
 pub mod modify;
 pub mod parse;
 pub mod registry;
@@ -50,6 +51,7 @@ pub use self::encode::{
 pub use self::eval::{eval_b, evaluate, Env, EvalError};
 pub use self::fraud::{replay, FraudProof, ReplayOutcome};
 pub use self::host::{LedgerState, Operation, OperationData};
+pub use self::limits::MAX_DEPTH;
 pub use self::modify::{admit_modification, candidate, ModificationRejected, ModifyError};
 pub use self::parse::{parse, ParseError};
 pub use self::registry::{CmpOp, StatePred, Symbol, ValueFn};
