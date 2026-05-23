@@ -1,72 +1,121 @@
-![Build](https://github.com/rust-bitcoin/rust-miniscript/workflows/Continuous%20integration/badge.svg)
+# rust-miniscript + dep-16 calculus
 
-**Minimum Supported Rust Version:** 1.56.1
+An extension of [rust-miniscript](https://github.com/rust-bitcoin/rust-miniscript) that implements **dep-16**, a monotone term calculus for ledger-based deposit authorization, and **dep-17**, its canonical encodings. The upstream library is preserved unchanged — the upstream README is at [`README.upstream.md`](README.upstream.md) — and the new work lives in [`src/calculus/`](src/calculus/) behind the `dep16` cargo feature. Built on the upstream crate by Andrew Poelstra, Sanket Kanjalkar, and contributors.
 
-# Miniscript
+## What it is
 
-Library for handling [Miniscript](http://bitcoin.sipa.be/miniscript/),
-which is a subset of Bitcoin Script designed to support simple and general
-tooling. Miniscripts represent threshold circuits of spending conditions,
-and can therefore be easily visualized or serialized as human-readable
-strings.
+In Bitcoin, miniscript describes *spend* authorization compiled to Script and evaluated against a witness stack. dep-16 generalizes that model to a ledger / account setting: a deposit is an account with state (balance, descriptor, history), and the descriptor authorizes **any** operation against the account — spending, modifying the descriptor itself, accepting an incoming payment, updating metadata — by evaluating a closed term against `(operation, ledger-state, witness)`.
 
-## High-Level Features
+Key properties:
 
-This library supports
+- **Witness-monotone by construction.** A single static placement rule — proof obligations only in positive position — guarantees that acquiring additional capabilities (a signature, a preimage) never revokes authority. Checked at deposit-open and re-checked after every modification.
+- **Self-modifying.** A descriptor can authorize changes to itself, including ones that *expand* authority (social recovery, key rotation) — patterns that capability-narrowing systems cannot express.
+- **Strict and total.** Evaluation is a typed fold over a fixed term with no recursion, no search, no fixpoint; cost is bounded in the term and operation size.
+- **Deterministic fraud proofs.** Every operation produces the same fraud-proof shape; replay is bit-identical given dep-17's canonical encodings, with full canonical rejection on decode.
+- **Real crypto, generic surface.** ECDSA and BIP-340 Schnorr verifiers ride a `Verifier` trait, so the calculus stays generic over the key type. `bitcoin::PublicKey` and `XOnlyPublicKey` both work.
 
-* [Output descriptors](https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md)
-including embedded Miniscripts
-* Parsing and serializing descriptors to a human-readable string format
-* Compilation of abstract spending policies to Miniscript (enabled by the
-`compiler` flag)
-* Semantic analysis of Miniscripts and spending policies, with user-defined
-public key types
-* Encoding and decoding Miniscript as Bitcoin Script, given key types that
-are convertible to `bitcoin::PublicKey`
-* Determining satisfiability, and optimal witnesses, for a given descriptor;
-completing an unsigned `bitcoin::TxIn` with appropriate data
-* Determining the specific keys, hash preimages and timelocks used to spend
-coins in a given Bitcoin transaction
-* `no_std` support enabled by disabling the `default-features` and enabling
-`"no-std"`. See `embedded/` for an example.
+The formal calculus, monotonicity theorem, and reflexivity argument live in the dep documents (a separate repo). The implementation plan is in [`PLAN.md`](PLAN.md).
 
-More information can be found in [the documentation](https://docs.rs/miniscript)
-or in [the `examples/` directory](https://github.com/rust-bitcoin/rust-miniscript/tree/master/examples)
+## Example descriptors
 
-## Building
+**Social recovery** — guardians may rotate the owner's key after a long inactivity window. Authority *expands* under the recovery branch, which capability-narrowing systems cannot express:
 
-The cargo feature `std` is enabled by default. At least one of the features `std` or `no-std` or both must be enabled.
+```
+with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
+  branch(spend, prove(pk(owner))),
+  branch(replace, or(
+    prove(pk(owner)),
+    and(
+      prove(pk_threshold(2, guardians)),
+      blocks_since_activity_at_least(4320),
+      cmp(=, operation_path(), path(0))
+    )
+  )),
+  branch(else, false)
+))
+```
 
-Enabling the `no-std` feature does not disable `std`. To disable the `std` feature you must disable default features. The `no-std` feature only enables additional features required for this crate to be usable without `std`. Both can be enabled without conflict.
+**Liana (decaying multisig)** — 2-of-2 primary path, single-key recovery that becomes spendable after a span of inactivity (`older` reads blocks-since-activity in the ledger model, so the recovery timer resets on every spend — the same intent as Bitcoin CSV):
 
-## Minimum Supported Rust Version (MSRV)
+```
+with(primary_a = K1, primary_b = K2, recovery = K3, in match(operation_type(),
+  branch(spend, or(
+    and(prove(pk(primary_a)), prove(pk(primary_b))),
+    and(prove(pk(recovery)), older(65535))
+  )),
+  branch(else, false)
+))
+```
 
-This library should always compile with any combination of features on **Rust 1.56.1**.
+**Linear vesting** — the beneficiary may withdraw only up to the linearly-vested fraction of an allocation, with cumulative withdrawals bounded by `vested = allocation · min(elapsed, vesting_blocks) / vesting_blocks`:
 
-Some dependencies do not play nicely with our MSRV, if you are running the tests
-you may need to pin some dependencies. See `./contrib/test.sh` for current pinning.
+```
+with(beneficiary = K1, allocation = 1000000, vesting_blocks = 52560,
+  in match(operation_type(),
+    branch(spend, and(
+      prove(pk(beneficiary)),
+      cmp(<=,
+        add(cumulative_spent_via(path(0)), operation_arg(amount)),
+        div(mul(allocation, min(blocks_since_open(), vesting_blocks)), vesting_blocks)
+      )
+    )),
+    branch(else, false)
+  ))
+```
 
-## Contributing
+More templates — spending rate limit, inheritance, dead-man's-switch keyed on incoming payments, cliff vesting — live in [`src/calculus/tests.rs`](src/calculus/tests.rs) under the `templates` and `ledger_primitives` modules, each as a documented descriptor with behavior tests.
 
-Contributions are generally welcome. If you intend to make larger changes please
-discuss them in an issue before PRing them to avoid duplicate work and
-architectural mismatches. If you have any questions or ideas you want to discuss
-please join us in
-[##miniscript](https://web.libera.chat/?channels=##miniscript) on Libera.
+## Running it
 
-## Benchmarks
+The calculus is gated on the `dep16` feature; the default build is unchanged upstream miniscript.
 
-We use a custom Rust compiler configuration conditional to guard the bench mark code. To run the
-bench marks use: `RUSTFLAGS='--cfg=bench' cargo +nightly bench`.
+```
+# The calculus suite (parse, eval, admission, modification, codec, real ECDSA + Schnorr).
+cargo test --features dep16 --lib calculus::
 
+# Just the worked wallet templates.
+cargo test --features dep16 --lib templates::
 
-## Release Notes
+# The witness-monotonicity property test (500 adversarial terms through admission).
+cargo test --features dep16 --lib monotonicity::
 
-See [CHANGELOG.md](CHANGELOG.md).
+# The fraud-proof bundle round-trip and adjudication.
+cargo test --features dep16 --lib fraud_bundle::
 
+# The full library suite.
+cargo test --features dep16
 
-## Licensing
+# Default build — only the upstream miniscript code is compiled.
+cargo build
+```
 
-The code in this project is licensed under the [Creative Commons CC0 1.0
-Universal license](LICENSE). We use the [SPDX license list](https://spdx.org/licenses/) and [SPDX
-IDs](https://spdx.dev/ids/).
+There are no example binaries yet; the test modules are written to double as worked documentation — each template is a short, readable descriptor with the scenarios it authorizes and rejects.
+
+## Module map
+
+```
+src/calculus/
+  ast            sort-indexed AST (BTerm / VTerm / Obligation)
+  parse          combinator surface + with(=) + [list] + hash/bytes literals
+  eval           strict total fold to a verdict
+  admission      polarity + capability + var-resolution checks
+  modify         insert / replace / delete -> T' + re-admission
+  encode         dep-17 byte encoding + descriptor_id + canonical decoder
+  fraud          replay and the self-contained FraudProof bundle
+  host           Operation / LedgerState traits + OperationData
+  witness        keyed Witness bundle
+  signature      Verifier trait
+  secp           EcdsaVerifier + SchnorrVerifier (BIP-340)
+  snapshot       concrete LedgerState carried by a FraudProof
+  capability     CapabilitySet (operator-declared primitives)
+  schema         attestation schemas
+  registry       value functions, state predicates, comparison ops
+  value          Value enum + saturating arithmetic
+  tests          integration tests (worked examples, templates, codec)
+```
+
+The upstream miniscript implementation is untouched — descriptors that compile to Bitcoin Script work exactly as before. The calculus adds a parallel evaluator for the off-chain ledger model, sharing only `MiniscriptKey`, the hash primitives, and the existing key serializations.
+
+## License
+
+CC0-1.0, the same as upstream.
