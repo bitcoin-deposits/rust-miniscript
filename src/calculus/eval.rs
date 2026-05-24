@@ -375,7 +375,7 @@ where
     match o {
         Obligation::Pk(v) => Ok(signed_by(&as_key(v)?)),
         Obligation::PkAny(v) => Ok(as_keys(v)?.iter().any(signed_by)),
-        Obligation::PkThreshold(k, v) => {
+        Obligation::Multi(k, v) => {
             let mut keys = as_keys(v)?;
             keys.sort();
             keys.dedup();

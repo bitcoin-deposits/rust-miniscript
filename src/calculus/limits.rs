@@ -9,4 +9,8 @@
 
 /// Maximum nesting depth of an AST during parse, decode, and modification. Terms deeper than this
 /// are rejected at the boundary; admission rejects descriptors exceeding it.
-pub const MAX_DEPTH: usize = 256;
+///
+/// 128 is chosen to stay well within typical thread-stack budgets (2 MiB on most platforms,
+/// including the default cargo-test thread) even in debug builds where stack frames are larger.
+/// It is also far deeper than any realistic descriptor.
+pub const MAX_DEPTH: usize = 128;

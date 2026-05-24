@@ -182,7 +182,7 @@ fn check_o<Pk: MiniscriptKey>(
         Obligation::Pk(v)
         | Obligation::PkH(v)
         | Obligation::PkAny(v)
-        | Obligation::PkThreshold(_, v)
+        | Obligation::Multi(_, v)
         | Obligation::Hashlock(v)
         | Obligation::Attest(v, _) => check_v(v, caps, env),
     }

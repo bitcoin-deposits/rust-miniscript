@@ -339,7 +339,14 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Word(w)) => {
                 let w = w.clone();
-                // hash literal: `sha256:0x...`
+                // Hash literal: `sha256(0x...)` is canonical; `sha256:0x...` is legacy.
+                if is_hashfn(&w) && matches!(self.tokens.get(self.pos + 1), Some(Tok::LParen)) {
+                    self.pos += 1;
+                    self.expect(&Tok::LParen)?;
+                    let hexword = self.word()?;
+                    self.expect(&Tok::RParen)?;
+                    return Ok(Value::Hash(hash_literal(&w, &hexword)?));
+                }
                 if is_hashfn(&w) && matches!(self.tokens.get(self.pos + 1), Some(Tok::Colon)) {
                     self.pos += 1;
                     self.expect(&Tok::Colon)?;
@@ -424,8 +431,30 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::RParen)?;
                 BTerm::Prove(o)
             }
+            // Comparison predicates as direct BTerm forms (boring; matches miniscript-style
+            // naming). The legacy `cmp(<op>, a, b)` form above still parses.
+            "eq" | "lt" | "le" | "gt" | "ge" => {
+                let op = match name.as_str() {
+                    "eq" => CmpOp::Eq,
+                    "lt" => CmpOp::Lt,
+                    "le" => CmpOp::Le,
+                    "gt" => CmpOp::Gt,
+                    "ge" => CmpOp::Ge,
+                    _ => unreachable!(),
+                };
+                let a = self.vterm()?;
+                self.expect(&Tok::Comma)?;
+                let b = self.vterm()?;
+                self.expect(&Tok::RParen)?;
+                BTerm::Cmp(op, a, b)
+            }
             other => {
-                if let Some(pred) = StatePred::from_name(other) {
+                if Self::is_obligation_name(other) {
+                    // Direct obligation form at BTerm position — `pk(K)` rather than
+                    // `prove(pk(K))`. Matches miniscript surface; internally still wraps in Prove.
+                    let o = self.obligation_body(other)?;
+                    BTerm::Prove(o)
+                } else if let Some(pred) = StatePred::from_name(other) {
                     let args = self.vterm_list()?;
                     BTerm::State(pred, args)
                 } else {
@@ -491,13 +520,28 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn obligation<Pk>(&mut self) -> Result<Obligation<Pk>, ParseError>
+    /// True iff `name` is a proof-obligation form (so it can be dispatched directly at BTerm
+    /// position without the `prove(...)` wrapper, matching miniscript's `pk(K)` etc.).
+    fn is_obligation_name(name: &str) -> bool {
+        matches!(
+            name,
+            "pk" | "pk_h"
+                | "pk_any"
+                | "multi"
+                | "pk_threshold"
+                | "hashlock"
+                | "attest"
+        )
+    }
+
+    /// Parse the body of an obligation `name(...)` whose name and opening `(` have already been
+    /// consumed. Shared between the `prove(<obligation>)` legacy form and the direct dispatch
+    /// from `bterm` (where `pk(K)` admits as a BTerm without the `prove` wrapper).
+    fn obligation_body<Pk>(&mut self, name: &str) -> Result<Obligation<Pk>, ParseError>
     where
         Pk: MiniscriptKey + FromStr,
     {
-        let name = self.word()?;
-        self.expect(&Tok::LParen)?;
-        let result = match name.as_str() {
+        let result = match name {
             "pk" => {
                 let v = self.vterm()?;
                 self.expect(&Tok::RParen)?;
@@ -513,12 +557,14 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::RParen)?;
                 Obligation::PkAny(v)
             }
-            "pk_threshold" => {
+            // `multi` is the canonical name (matches miniscript); `pk_threshold` is the legacy
+            // alias from an earlier iteration of this codebase.
+            "multi" | "pk_threshold" => {
                 let k = self.num()? as usize;
                 self.expect(&Tok::Comma)?;
                 let v = self.vterm()?;
                 self.expect(&Tok::RParen)?;
-                Obligation::PkThreshold(k, v)
+                Obligation::Multi(k, v)
             }
             "hashlock" => {
                 let v = self.vterm()?;
@@ -535,6 +581,16 @@ impl<'a> Parser<'a> {
             other => return err(format!("unknown proof obligation `{}`", other)),
         };
         Ok(result)
+    }
+
+    /// Parse a full obligation form `name(...)`, used by the legacy `prove(<obligation>)` wrapper.
+    fn obligation<Pk>(&mut self) -> Result<Obligation<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        let name = self.word()?;
+        self.expect(&Tok::LParen)?;
+        self.obligation_body(&name)
     }
 
     fn schema(&mut self) -> Result<Schema, ParseError> {
@@ -577,7 +633,14 @@ impl<'a> Parser<'a> {
             Some(Tok::LBracket) => Ok(VTerm::Lit(self.literal()?)),
             Some(Tok::Word(w)) => {
                 let w = w.clone();
-                // hash literal: `sha256:0x...`
+                // Hash literal: `sha256(0x...)` is canonical; `sha256:0x...` is legacy.
+                if is_hashfn(&w) && matches!(self.tokens.get(self.pos + 1), Some(Tok::LParen)) {
+                    self.pos += 1;
+                    self.expect(&Tok::LParen)?;
+                    let hexword = self.word()?;
+                    self.expect(&Tok::RParen)?;
+                    return Ok(VTerm::Lit(Value::Hash(hash_literal(&w, &hexword)?)));
+                }
                 if is_hashfn(&w) && matches!(self.tokens.get(self.pos + 1), Some(Tok::Colon)) {
                     self.pos += 1;
                     self.expect(&Tok::Colon)?;

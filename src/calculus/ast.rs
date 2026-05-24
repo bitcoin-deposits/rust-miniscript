@@ -70,8 +70,8 @@ pub enum Obligation<Pk: MiniscriptKey> {
     PkH(VTerm<Pk>),
     /// Signed by at least one key in a list.
     PkAny(VTerm<Pk>),
-    /// Signed by at least `k` distinct keys in a list.
-    PkThreshold(usize, VTerm<Pk>),
+    /// Signed by at least `k` distinct keys in a list. Source name matches miniscript's `multi`.
+    Multi(usize, VTerm<Pk>),
     /// A preimage of a hash is revealed.
     Hashlock(VTerm<Pk>),
     /// An oracle attestation matching a schema is supplied.
@@ -154,7 +154,7 @@ impl<Pk: MiniscriptKey> Obligation<Pk> {
             Obligation::Pk(_) => "pk",
             Obligation::PkH(_) => "pk_h",
             Obligation::PkAny(_) => "pk_any",
-            Obligation::PkThreshold(_, _) => "pk_threshold",
+            Obligation::Multi(_, _) => "multi",
             Obligation::Hashlock(_) => "hashlock",
             Obligation::Attest(_, _) => "attest",
         }

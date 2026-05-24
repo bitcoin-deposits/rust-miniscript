@@ -158,9 +158,17 @@ fn write_b<Pk: MiniscriptKey + Display>(out: &mut String, t: &BTerm<Pk>) {
             out.push_str("))");
         }
         BTerm::Cmp(op, a, b) => {
-            out.push_str("cmp(");
-            out.push_str(op.name());
-            out.push_str(", ");
+            // Canonical source uses the direct predicate name (eq/lt/le/gt/ge) rather than
+            // `cmp(<op>, a, b)`. Parser still accepts both forms.
+            let name = match op {
+                CmpOp::Eq => "eq",
+                CmpOp::Lt => "lt",
+                CmpOp::Le => "le",
+                CmpOp::Gt => "gt",
+                CmpOp::Ge => "ge",
+            };
+            out.push_str(name);
+            out.push('(');
             write_v(out, a);
             out.push_str(", ");
             write_v(out, b);
@@ -172,11 +180,7 @@ fn write_b<Pk: MiniscriptKey + Display>(out: &mut String, t: &BTerm<Pk>) {
             write_list(out, args, write_v);
             out.push(')');
         }
-        BTerm::Prove(o) => {
-            out.push_str("prove(");
-            write_o(out, o);
-            out.push(')');
-        }
+        BTerm::Prove(o) => write_o(out, o),
     }
 }
 
@@ -185,8 +189,8 @@ fn write_o<Pk: MiniscriptKey + Display>(out: &mut String, o: &Obligation<Pk>) {
         Obligation::Pk(v) => wrap(out, "pk", v),
         Obligation::PkH(v) => wrap(out, "pk_h", v),
         Obligation::PkAny(v) => wrap(out, "pk_any", v),
-        Obligation::PkThreshold(k, v) => {
-            out.push_str("pk_threshold(");
+        Obligation::Multi(k, v) => {
+            out.push_str("multi(");
             out.push_str(&k.to_string());
             out.push_str(", ");
             write_v(out, v);
@@ -260,6 +264,8 @@ fn write_value<Pk: MiniscriptKey + Display>(out: &mut String, v: &Value<Pk>) {
 }
 
 fn write_hash(out: &mut String, h: &HashValue) {
+    // Canonical source uses function-call form `sha256(0x...)`, matching miniscript. Parser also
+    // accepts the legacy `sha256:0x...` form.
     let (tag, bytes): (&str, &[u8]) = match h {
         HashValue::Sha256(d) => ("sha256", d),
         HashValue::Hash256(d) => ("hash256", d),
@@ -267,10 +273,11 @@ fn write_hash(out: &mut String, h: &HashValue) {
         HashValue::Hash160(d) => ("hash160", d),
     };
     out.push_str(tag);
-    out.push_str(":0x");
+    out.push_str("(0x");
     for byte in bytes {
         out.push_str(&format!("{:02x}", byte));
     }
+    out.push(')');
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -509,7 +516,7 @@ fn put_obligation<Pk: MiniscriptKey + CanonicalKey>(out: &mut Vec<u8>, o: &Oblig
             put_u16(out, 0x0002);
             put_vterm(out, v);
         }
-        Obligation::PkThreshold(k, v) => {
+        Obligation::Multi(k, v) => {
             put_u16(out, 0x0003);
             put_u32(out, *k as u32);
             put_vterm(out, v);
@@ -950,7 +957,7 @@ fn dec_obligation<Pk: MiniscriptKey + CanonicalKey>(
         0x0002 => Obligation::PkAny(dec_vterm(d, depth + 1)?),
         0x0003 => {
             let k = d.u32()? as usize;
-            Obligation::PkThreshold(k, dec_vterm(d, depth + 1)?)
+            Obligation::Multi(k, dec_vterm(d, depth + 1)?)
         }
         0x0004 => Obligation::Hashlock(dec_vterm(d, depth + 1)?),
         0x0005 => {

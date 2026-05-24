@@ -23,7 +23,7 @@ pub enum ObligationKind {
     /// `pk_any`.
     PkAny,
     /// `pk_threshold`.
-    PkThreshold,
+    Multi,
     /// `hashlock`.
     Hashlock,
     /// `attest`.
@@ -37,7 +37,7 @@ impl<Pk: crate::MiniscriptKey> Obligation<Pk> {
             Obligation::Pk(_) => ObligationKind::Pk,
             Obligation::PkH(_) => ObligationKind::PkH,
             Obligation::PkAny(_) => ObligationKind::PkAny,
-            Obligation::PkThreshold(_, _) => ObligationKind::PkThreshold,
+            Obligation::Multi(_, _) => ObligationKind::Multi,
             Obligation::Hashlock(_) => ObligationKind::Hashlock,
             Obligation::Attest(_, _) => ObligationKind::Attest,
         }
@@ -92,7 +92,7 @@ const ALL_OBLIGATIONS: [ObligationKind; 6] = [
     ObligationKind::Pk,
     ObligationKind::PkH,
     ObligationKind::PkAny,
-    ObligationKind::PkThreshold,
+    ObligationKind::Multi,
     ObligationKind::Hashlock,
     ObligationKind::Attest,
 ];

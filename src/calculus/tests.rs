@@ -1686,7 +1686,7 @@ mod roundtrip_properties {
             0 => Obligation::Pk(gen_vterm(d, rng, for_source)),
             1 => Obligation::PkH(gen_vterm(d, rng, for_source)),
             2 => Obligation::PkAny(gen_vterm(d, rng, for_source)),
-            3 => Obligation::PkThreshold(rng.below(4) as usize, gen_vterm(d, rng, for_source)),
+            3 => Obligation::Multi(rng.below(4) as usize, gen_vterm(d, rng, for_source)),
             4 => Obligation::Hashlock(gen_vterm(d, rng, for_source)),
             _ => Obligation::Attest(
                 gen_vterm(d, rng, for_source),
@@ -1915,5 +1915,66 @@ mod fuzz_smoke {
         for data in samples() {
             let _ = FraudProof::<Pk>::decode(&data);
         }
+    }
+}
+
+mod boring_surface {
+    //! Verify that the canonical (miniscript-flavored) surface and the legacy forms both parse to
+    //! the same AST, and that `to_string` canonicalizes on the boring forms.
+    use super::*;
+    use crate::calculus::ast::{BTerm, Obligation};
+    use crate::calculus::encode::to_string;
+    use crate::calculus::registry::CmpOp;
+
+    #[test]
+    fn obligation_at_bterm_position_without_prove() {
+        // Both forms parse to the same AST.
+        let a = parse::<Pk>("pk(K1)").unwrap();
+        let b = parse::<Pk>("prove(pk(K1))").unwrap();
+        assert_eq!(a, b);
+        assert!(matches!(a.body, BTerm::Prove(Obligation::Pk(_))));
+        // Printer emits the boring form.
+        assert_eq!(to_string(&a), "pk(K1)");
+    }
+
+    #[test]
+    fn multi_alongside_pk_threshold() {
+        let a = parse::<Pk>("with(g = [K1, K2, K3], in multi(2, g))").unwrap();
+        let b = parse::<Pk>("with(g = [K1, K2, K3], in prove(pk_threshold(2, g)))").unwrap();
+        assert_eq!(a, b);
+        assert!(to_string(&a).contains("multi(2"));
+    }
+
+    #[test]
+    fn comparison_predicates_at_bterm_position() {
+        for (src, expected) in [
+            ("eq(1, 2)", CmpOp::Eq),
+            ("lt(1, 2)", CmpOp::Lt),
+            ("le(1, 2)", CmpOp::Le),
+            ("gt(1, 2)", CmpOp::Gt),
+            ("ge(1, 2)", CmpOp::Ge),
+        ] {
+            let d = parse::<Pk>(src).unwrap();
+            match d.body {
+                BTerm::Cmp(op, _, _) => assert_eq!(op, expected, "wrong op for `{}`", src),
+                other => panic!("expected Cmp, got {:?} for `{}`", other, src),
+            }
+        }
+        // Legacy cmp(<op>, a, b) still parses; canonical form is the predicate name.
+        let legacy = parse::<Pk>("cmp(<=, 1, 2)").unwrap();
+        let direct = parse::<Pk>("le(1, 2)").unwrap();
+        assert_eq!(legacy, direct);
+        assert_eq!(to_string(&legacy), "le(1, 2)");
+    }
+
+    #[test]
+    fn hash_literal_in_function_call_form() {
+        // sha256(0x...) is canonical; sha256:0x... is legacy.
+        let hex = "01".repeat(32);
+        let func = parse::<Pk>(&format!("with(h = sha256(0x{}), in true)", hex)).unwrap();
+        let colon = parse::<Pk>(&format!("with(h = sha256:0x{}, in true)", hex)).unwrap();
+        assert_eq!(func, colon);
+        // Printer emits the function-call form.
+        assert!(to_string(&func).contains("sha256(0x"));
     }
 }
