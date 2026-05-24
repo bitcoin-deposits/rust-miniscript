@@ -2198,19 +2198,27 @@ mod partial_reveal_modification {
     // ----------------------------------------------------------------------------------------
 
     #[test]
-    fn key_path_authorizes_a_modification_the_body_would_forbid() {
-        // The body only lets K2 do a replace. The internal key K1 signs. Under tr, K1's signature
-        // alone authorizes — the body never has to fire. The same shape under wsh would reject.
+    fn internal_key_authorizes_in_addition_to_the_body() {
+        // `tr(K, BODY)` is semantically `or(pk(K), BODY)`: the internal key is an *additional*
+        // authorization path on top of whatever BODY says. So a body that mentions only K2 still
+        // lets K1 (the internal key) authorize — not because the body changed its mind, but
+        // because tr added K1 as a parallel path. The same BODY under wsh has no such path.
+        //
+        // This is the same footgun that Bitcoin P2TR has: an internal key with weak custody
+        // bypasses the script regardless of how restrictive the script is. Picking the internal
+        // key is a security decision distinct from picking script-path keys.
         let body = only_k2_can_replace();
         let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), body.clone());
         let wsh = Descriptor::wsh(BTreeMap::new(), body);
         let op = MockOp::replace(vec![0], pk("K9"));
 
-        // K2 absent, K1 signs: tr accepts (key-path), wsh rejects (no script-path satisfied).
+        // Under tr: K1's signature alone authorizes via the key-path.
         assert!(decide_d(&tr, &op, &["K1"]));
+        // Under wsh: K1 is just an unrelated key — the body doesn't mention it, so nothing in the
+        // body authorizes, and there's no key-path to fall back on.
         assert!(!decide_d(&wsh, &op, &["K1"]));
 
-        // And the full modify flow is admitted under tr without ever satisfying the body.
+        // And under tr the full modify flow goes through without the body ever firing.
         let admitted =
             admit_modification(&tr, &op, &CapabilitySet::everything()).expect("admitted");
         assert_eq!(admitted.body().unwrap().subterm_at(&[0]), Some(&pk("K9")));
