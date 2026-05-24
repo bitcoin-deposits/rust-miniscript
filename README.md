@@ -111,6 +111,8 @@ cargo build
 
 There are no example binaries yet; the test modules are written to double as worked documentation — each template is a short, readable descriptor with the scenarios it authorizes and rejects.
 
+This implementation was built collaboratively with an AI coding assistant. See [VERIFICATION.md](VERIFICATION.md) for the inventory of what we did to convince ourselves the code matches its specification — what's enforced at compile time, what's tested, what's fuzzed, and what we have not yet verified.
+
 ## Module map
 
 ```
