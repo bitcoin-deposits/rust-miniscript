@@ -2044,27 +2044,31 @@ mod wrappers {
     }
 
     #[test]
-    fn tr_key_path_authorizes_any_operation() {
-        // `tr(K)` — only the key-path. Sign with K, and any operation type is authorized.
+    fn tr_k_is_equivalent_to_prove_pk_k() {
+        // Semantics: `tr(K)` ≡ `prove(pk(K))`. The descriptor accepts an operation iff K signs
+        // it, regardless of op type — there is no body to consult or restrict the surface.
         let d = parse::<Pk>("tr(K1)").unwrap();
         let spend = MockOp::spend(100, "anywhere");
         let modify = MockOp::of_type("insert");
+        // K1 signs → accepted for both op types.
         assert!(decide_descriptor(&d, &spend, &MockLedger::default(), &["K1"]));
         assert!(decide_descriptor(&d, &modify, &MockLedger::default(), &["K1"]));
-        // Without K1's signature, nothing is authorized.
+        // K1 absent → rejected, same as `pk(K1)` would be.
         assert!(!decide_descriptor(&d, &spend, &MockLedger::default(), &[]));
     }
 
     #[test]
-    fn tr_falls_through_to_body_when_key_absent() {
-        // `tr(K1, pk(K2))` — K1 is key-path, K2 is script-path.
+    fn tr_k_body_is_equivalent_to_or_pk_k_body() {
+        // Semantics: `tr(K, BODY)` ≡ `or(prove(pk(K)), BODY)`. The internal key is a parallel
+        // authorization path on top of whatever BODY says; eval tries the key-path first purely
+        // as an optimization. Either path alone suffices; neither requires the other.
         let d = parse::<Pk>("tr(K1, pk(K2))").unwrap();
         let op = MockOp::spend(1, "x");
-        // K1 alone authorizes (key-path).
+        // K1 alone authorizes (key-path arm of the or).
         assert!(decide_descriptor(&d, &op, &MockLedger::default(), &["K1"]));
-        // K2 alone authorizes (script-path).
+        // K2 alone authorizes (body arm of the or).
         assert!(decide_descriptor(&d, &op, &MockLedger::default(), &["K2"]));
-        // Neither: rejected.
+        // Neither arm satisfied → rejected.
         assert!(!decide_descriptor(&d, &op, &MockLedger::default(), &["K3"]));
     }
 
