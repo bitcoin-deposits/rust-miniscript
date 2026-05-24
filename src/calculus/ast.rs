@@ -208,4 +208,18 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
     pub fn wsh(constants: BTreeMap<String, Value<Pk>>, body: BTerm<Pk>) -> Self {
         Descriptor { constants, scheme: Scheme::Wsh { body } }
     }
+
+    /// Convenience constructor for `tr(K, BODY)`.
+    pub fn tr(
+        constants: BTreeMap<String, Value<Pk>>,
+        internal_key: Pk,
+        body: BTerm<Pk>,
+    ) -> Self {
+        Descriptor { constants, scheme: Scheme::Tr { internal_key, body: Some(body) } }
+    }
+
+    /// Convenience constructor for `tr(K)` — key-path only, no script-path body.
+    pub fn tr_key_only(constants: BTreeMap<String, Value<Pk>>, internal_key: Pk) -> Self {
+        Descriptor { constants, scheme: Scheme::Tr { internal_key, body: None } }
+    }
 }

@@ -76,6 +76,17 @@ impl MockOp {
         args.insert("subtree".to_string(), Value::Subtree(Box::new(subtree)));
         MockOp { ty: "replace", args, nonce: 0 }
     }
+    fn insert(path: Vec<usize>, subtree: super::ast::BTerm<Pk>) -> Self {
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), Value::Path(path));
+        args.insert("subtree".to_string(), Value::Subtree(Box::new(subtree)));
+        MockOp { ty: "insert", args, nonce: 0 }
+    }
+    fn delete(path: Vec<usize>) -> Self {
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), Value::Path(path));
+        MockOp { ty: "delete", args, nonce: 0 }
+    }
     fn with_nonce(mut self, nonce: u64) -> Self {
         self.nonce = nonce;
         self
@@ -2087,5 +2098,272 @@ mod wrappers {
     ) -> bool {
         let w = witness_signed_by(op, signers);
         evaluate(d, op, st, &w, &MockVerifier).expect("eval")
+    }
+}
+
+mod partial_reveal_modification {
+    //! Modification under `tr(...)`'s key-path: thornier than the wsh case because the witness
+    //! reveals nothing about the body, yet `candidate(...)` still has to compute the post-image
+    //! from the body. The signer "sees" only the internal key; the verifier sees the body. Tests
+    //! here pin down that asymmetry, the scheme-preservation invariants, and the cases that should
+    //! still be rejected even when K signs.
+    use super::*;
+    use crate::calculus::admission::AdmissionError;
+    use crate::calculus::ast::{BTerm, Descriptor, Obligation, Scheme, VTerm};
+    use crate::calculus::capability::CapabilitySet;
+    use crate::calculus::encode::{descriptor_id, encode_descriptor};
+    use crate::calculus::modify::{
+        admit_modification, candidate, ModificationRejected, ModifyError,
+    };
+    use crate::calculus::registry::{Symbol, ValueFn};
+
+    fn pk(k: &str) -> BTerm<Pk> {
+        BTerm::Prove(Obligation::Pk(VTerm::Lit(Value::Key(k.to_string()))))
+    }
+
+    /// A body that only K2 can replace — under wsh this is the whole policy; under tr it is what
+    /// the script-path adds on top of the internal key.
+    fn only_k2_can_replace() -> BTerm<Pk> {
+        BTerm::Match {
+            scrutinee: VTerm::Op(ValueFn::OperationType, vec![]),
+            arms: vec![(Symbol::new("replace"), pk("K2"))],
+            default: Box::new(BTerm::Const(false)),
+        }
+    }
+
+    /// Convenience for "did the witness authorize this op against this descriptor?".
+    fn decide_d(d: &Descriptor<Pk>, op: &MockOp, signers: &[&str]) -> bool {
+        let w = witness_signed_by(op, signers);
+        evaluate(d, op, &MockLedger::default(), &w, &MockVerifier).unwrap()
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Scheme & internal-key invariants
+    // ----------------------------------------------------------------------------------------
+
+    #[test]
+    fn modification_preserves_scheme_and_internal_key() {
+        // wsh stays wsh; tr stays tr with the same internal key. AST paths address the body only.
+        let wsh = Descriptor::wsh(BTreeMap::new(), only_k2_can_replace());
+        let wsh_cand = candidate(&wsh, &MockOp::replace(vec![0], pk("K9"))).unwrap();
+        assert!(matches!(wsh_cand.scheme, Scheme::Wsh { .. }));
+
+        let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), only_k2_can_replace());
+        let tr_cand = candidate(&tr, &MockOp::replace(vec![0], pk("K9"))).unwrap();
+        match &tr_cand.scheme {
+            Scheme::Tr { internal_key, body: Some(_) } => assert_eq!(internal_key, "K1"),
+            other => panic!("expected Tr with body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn internal_key_is_unreachable_from_any_modify_path() {
+        // The internal key lives outside the body. Modifications navigate paths into the body;
+        // none of them can touch K. Try paths of varying depth and op types — K is always K1.
+        let original = "K1".to_string();
+        let tr = Descriptor::tr(
+            BTreeMap::new(),
+            original.clone(),
+            BTerm::And(vec![pk("K2"), BTerm::Or(vec![pk("K3"), pk("K4")])]),
+        );
+        let ops: Vec<MockOp> = vec![
+            MockOp::replace(vec![], pk("K9")),       // whole body
+            MockOp::replace(vec![0], pk("K9")),      // first child
+            MockOp::replace(vec![1, 0], pk("K9")),   // nested child
+            MockOp::delete(vec![0]),                 // delete first child
+            MockOp::insert(vec![1], pk("K9")),       // insert at the end of And
+        ];
+        for op in &ops {
+            let cand = candidate(&tr, op).expect("candidate");
+            match &cand.scheme {
+                Scheme::Tr { internal_key, .. } => assert_eq!(internal_key, &original),
+                other => panic!("expected Tr after modify, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn modification_changes_descriptor_id() {
+        let d = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
+        let cand = candidate(&d, &MockOp::replace(vec![], pk("K9"))).unwrap();
+        assert_ne!(descriptor_id(&d), descriptor_id(&cand));
+        // The scheme byte hasn't changed; the body bytes have.
+        let before = encode_descriptor(&d);
+        let after = encode_descriptor(&cand);
+        assert_eq!(before[0], after[0]); // 0x02 SCHEME_TR
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Key-path authorization for modifications
+    // ----------------------------------------------------------------------------------------
+
+    #[test]
+    fn key_path_authorizes_a_modification_the_body_would_forbid() {
+        // The body only lets K2 do a replace. The internal key K1 signs. Under tr, K1's signature
+        // alone authorizes — the body never has to fire. The same shape under wsh would reject.
+        let body = only_k2_can_replace();
+        let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), body.clone());
+        let wsh = Descriptor::wsh(BTreeMap::new(), body);
+        let op = MockOp::replace(vec![0], pk("K9"));
+
+        // K2 absent, K1 signs: tr accepts (key-path), wsh rejects (no script-path satisfied).
+        assert!(decide_d(&tr, &op, &["K1"]));
+        assert!(!decide_d(&wsh, &op, &["K1"]));
+
+        // And the full modify flow is admitted under tr without ever satisfying the body.
+        let admitted =
+            admit_modification(&tr, &op, &CapabilitySet::everything()).expect("admitted");
+        assert_eq!(admitted.body().unwrap().subterm_at(&[0]), Some(&pk("K9")));
+    }
+
+    #[test]
+    fn key_path_can_replace_the_root_body_wholesale() {
+        // `replace_at(body, [], new)` rewrites the entire body. With tr's key-path, K alone is
+        // sufficient to swap the policy out for an unrelated one.
+        let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), only_k2_can_replace());
+        let op = MockOp::replace(vec![], pk("K9"));
+        assert!(decide_d(&tr, &op, &["K1"]));
+        let new_d =
+            admit_modification(&tr, &op, &CapabilitySet::everything()).expect("admitted");
+        assert_eq!(new_d.body().unwrap(), &pk("K9"));
+        // Internal key did not move.
+        match &new_d.scheme {
+            Scheme::Tr { internal_key, .. } => assert_eq!(internal_key, "K1"),
+            _ => panic!("expected Tr"),
+        }
+    }
+
+    #[test]
+    fn key_path_modification_witness_carries_no_body_information() {
+        // The "partial reveal" property at the witness layer: K's signature is the only thing the
+        // witness needs to contain. The witness does *not* mention any body branch, threshold
+        // signer, hash preimage, or path traversal — those would all be required to satisfy the
+        // body. This is what makes tr's key-path a partial reveal in spirit even without a
+        // leaf-Merkle commitment over the body.
+        let body = BTerm::Or(vec![
+            pk("K_a"),
+            BTerm::And(vec![pk("K_b"), pk("K_c"), pk("K_d")]),
+        ]);
+        let tr = Descriptor::tr(BTreeMap::new(), "K_super".to_string(), body);
+        let op = MockOp::replace(vec![], pk("K9"));
+
+        let minimal_witness = witness_signed_by(&op, &["K_super"]);
+        // The witness has exactly one signature entry — for the internal key only.
+        assert_eq!(minimal_witness.signatures.len(), 1);
+        assert!(minimal_witness.signatures.contains_key(&"K_super".to_string()));
+        // And it authorizes.
+        assert!(evaluate(&tr, &op, &MockLedger::default(), &minimal_witness, &MockVerifier)
+            .unwrap());
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Rejections that still apply, even via key-path
+    // ----------------------------------------------------------------------------------------
+
+    #[test]
+    fn key_path_does_not_excuse_an_inadmissible_candidate() {
+        // K1 signs, so the *operation* would be authorized — but `replace_at` produces a body that
+        // violates polarity (`not(prove(...))`). Admission still runs on the candidate and
+        // rejects: a key-path-authorized modification cannot install an ill-formed policy.
+        let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
+        let bad = BTerm::Not(Box::new(pk("K9")));
+        let op = MockOp::replace(vec![], bad);
+
+        // Key-path authorizes the *operation*…
+        assert!(decide_d(&tr, &op, &["K1"]));
+        // …but the candidate is inadmissible.
+        match admit_modification(&tr, &op, &CapabilitySet::everything()) {
+            Err(ModificationRejected::Inadmissible(AdmissionError::NegativeProof)) => {}
+            other => panic!("expected NegativeProof, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn key_path_does_not_excuse_a_malformed_path() {
+        // Path indexes a position that doesn't exist. `candidate` fails to build the post-image,
+        // regardless of who signed.
+        let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
+        let op = MockOp::replace(vec![5], pk("K9"));
+        assert_eq!(candidate(&tr, &op), Err(ModifyError::PathOutOfRange));
+        match admit_modification(&tr, &op, &CapabilitySet::everything()) {
+            Err(ModificationRejected::Malformed(ModifyError::PathOutOfRange)) => {}
+            other => panic!("expected PathOutOfRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tr_without_body_cannot_be_modified_even_with_internal_key() {
+        // `tr(K)` has no body to navigate into. `candidate` returns MissingArg("body") because
+        // there is nothing for the path to address. Key-path can authorize *operations* of any
+        // type, but modifications need a body to operate on.
+        let tr = Descriptor::tr_key_only(BTreeMap::new(), "K1".to_string());
+        let op = MockOp::replace(vec![], pk("K9"));
+        assert_eq!(candidate(&tr, &op), Err(ModifyError::MissingArg("body")));
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Asymmetry & cross-context sanity
+    // ----------------------------------------------------------------------------------------
+
+    #[test]
+    fn candidate_depends_on_current_body_not_on_witness() {
+        // The candidate is a pure function of the current descriptor and the operation. The same
+        // K1 signature can authorize a `replace [] subtree=pk(K9)` op against two different
+        // descriptors with the same internal key, but each produces its own candidate body.
+        let b1 = pk("K_a");
+        let b2 = BTerm::And(vec![pk("K_b"), pk("K_c")]);
+        let d1 = Descriptor::tr(BTreeMap::new(), "K1".to_string(), b1);
+        let d2 = Descriptor::tr(BTreeMap::new(), "K1".to_string(), b2);
+        let op = MockOp::replace(vec![], pk("K9"));
+
+        let c1 = candidate(&d1, &op).unwrap();
+        let c2 = candidate(&d2, &op).unwrap();
+        // Same op, same result body (because path is [] and subtree is fixed).
+        assert_eq!(c1.body(), c2.body());
+        // But the starting descriptor ids are different — modify is *navigated* against the body
+        // we already have, even when the new body doesn't depend on the old one.
+        assert_ne!(descriptor_id(&d1), descriptor_id(&d2));
+    }
+
+    #[test]
+    fn signature_binds_to_path_and_subtree() {
+        // K1 signs a *specific* (path, subtree) pair. Reusing the signature against a different
+        // subtree under the same op type produces a different preimage, so verification fails.
+        let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
+        let real_op = MockOp::replace(vec![], pk("K9"));
+        let forged_op = MockOp::replace(vec![], pk("K_evil"));
+
+        let w = witness_signed_by(&real_op, &["K1"]);
+        // Authorizes the op it signed.
+        assert!(evaluate(&tr, &real_op, &MockLedger::default(), &w, &MockVerifier).unwrap());
+        // But not a forged op with a substituted subtree — the preimage differs, K's mock sig
+        // (key | "|" | preimage) won't verify.
+        assert!(!evaluate(&tr, &forged_op, &MockLedger::default(), &w, &MockVerifier).unwrap());
+    }
+
+    #[test]
+    fn admit_modification_chains_into_a_second_modification() {
+        // T --K1.modify--> T' --K1.modify--> T''. Each step's candidate becomes the next step's
+        // current. Scheme & internal key are preserved end-to-end; the body evolves.
+        let t0 = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
+        let step1 = MockOp::replace(vec![], BTerm::Or(vec![pk("K_a"), pk("K_b")]));
+        let t1 = admit_modification(&t0, &step1, &CapabilitySet::everything())
+            .expect("first step admitted");
+        let step2 = MockOp::replace(vec![1], pk("K_c"));
+        let t2 = admit_modification(&t1, &step2, &CapabilitySet::everything())
+            .expect("second step admitted");
+
+        // Internal key preserved across the chain.
+        for d in [&t0, &t1, &t2] {
+            match &d.scheme {
+                Scheme::Tr { internal_key, .. } => assert_eq!(internal_key, "K1"),
+                _ => panic!("scheme drifted"),
+            }
+        }
+        // Each id is fresh.
+        assert_ne!(descriptor_id(&t0), descriptor_id(&t1));
+        assert_ne!(descriptor_id(&t1), descriptor_id(&t2));
+        // Body content reflects step2.
+        assert_eq!(t2.body().unwrap().subterm_at(&[1]), Some(&pk("K_c")));
     }
 }
