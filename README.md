@@ -12,6 +12,7 @@ Key properties:
 - **Self-modifying.** A descriptor can authorize changes to itself, including ones that *expand* authority (social recovery, key rotation) — patterns that capability-narrowing systems cannot express.
 - **Strict and total.** Evaluation is a typed fold over a fixed term with no recursion, no search, no fixpoint; cost is bounded in the term and operation size.
 - **Deterministic fraud proofs.** Every operation produces the same fraud-proof shape; replay is bit-identical given dep-17's canonical encodings, with full canonical rejection on decode.
+- **Familiar wrapper surface.** Descriptors carry a scheme tag in the BIP-380 style: `wsh(BODY)` evaluates the body, `tr(K)` is key-path-only, `tr(K, BODY)` adds an internal-key bypass over the body (semantically `or(prove(pk(K)), BODY)`). A bare body parses as implicit `wsh`. The scheme tag is part of the descriptor commitment, so `wsh(BODY)` and `tr(K, BODY)` have distinct ids and a fraud proof cannot be replayed across schemes.
 - **Real crypto, generic surface.** ECDSA and BIP-340 Schnorr verifiers ride a `Verifier` trait, so the calculus stays generic over the key type. `bitcoin::PublicKey` and `XOnlyPublicKey` both work.
 
 The formal calculus, monotonicity theorem, and reflexivity argument live in the dep documents (a separate repo). The implementation plan is in [`PLAN.md`](PLAN.md).
@@ -21,7 +22,7 @@ The formal calculus, monotonicity theorem, and reflexivity argument live in the 
 **Social recovery** — guardians may rotate the owner's key after a long inactivity window. Authority *expands* under the recovery branch, which capability-narrowing systems cannot express:
 
 ```
-with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
+wsh(with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
   branch(spend, prove(pk(owner))),
   branch(replace, or(
     prove(pk(owner)),
@@ -32,7 +33,24 @@ with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
     )
   )),
   branch(else, false)
-))
+)))
+```
+
+**Internal-key bypass** — the same policy under `tr(K_super, ...)` adds a master key that can authorize any operation, including descriptor modification, without exercising the body. The same footgun as Bitcoin P2TR: the internal key's custody is a security decision distinct from the script-path keys'.
+
+```
+tr(K_super, with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
+  branch(spend, prove(pk(owner))),
+  branch(replace, or(
+    prove(pk(owner)),
+    and(
+      prove(pk_threshold(2, guardians)),
+      blocks_since_activity_at_least(4320),
+      cmp(=, operation_path(), path(0))
+    )
+  )),
+  branch(else, false)
+)))
 ```
 
 **Liana (decaying multisig)** — 2-of-2 primary path, single-key recovery that becomes spendable after a span of inactivity (`older` reads blocks-since-activity in the ledger model, so the recovery timer resets on every spend — the same intent as Bitcoin CSV):
@@ -95,12 +113,12 @@ There are no example binaries yet; the test modules are written to double as wor
 
 ```
 src/calculus/
-  ast            sort-indexed AST (BTerm / VTerm / Obligation)
-  parse          combinator surface + with(=) + [list] + hash/bytes literals
-  eval           strict total fold to a verdict
+  ast            sort-indexed AST (BTerm / VTerm / Obligation) + Scheme (wsh / tr)
+  parse          combinator surface + with(=) + [list] + hash/bytes + wsh/tr wrappers
+  eval           strict total fold to a verdict; key-path first on tr
   admission      polarity + capability + var-resolution checks
-  modify         insert / replace / delete -> T' + re-admission
-  encode         dep-17 byte encoding + descriptor_id + canonical decoder
+  modify         insert / replace / delete -> T' + re-admission; scheme preserved
+  encode         dep-17 byte encoding (scheme-tagged) + descriptor_id + canonical decoder
   fraud          replay and the self-contained FraudProof bundle
   host           Operation / LedgerState traits + OperationData
   witness        keyed Witness bundle
