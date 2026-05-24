@@ -15,7 +15,7 @@
 use crate::prelude::*;
 use crate::MiniscriptKey;
 
-use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::ast::{BTerm, Descriptor, Obligation, Scheme, VTerm};
 use super::encode::{operation_preimage, CanonicalKey};
 use super::host::{LedgerState, Operation};
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
@@ -57,7 +57,28 @@ where
     L: LedgerState,
     V: Verifier<Pk>,
 {
-    eval_b(&d.body, &d.constants, &d.body, op, st, w, verifier)
+    match &d.scheme {
+        Scheme::Wsh { body } => eval_b(body, &d.constants, body, op, st, w, verifier),
+        Scheme::Tr { internal_key, body } => {
+            // Key-path: a signature by `internal_key` over the operation authorizes anything,
+            // without touching the body. This is the bitcoin-taproot key-path's privacy benefit:
+            // an authorized key-path operation never needs to disclose the body.
+            let message = operation_preimage(op);
+            let key_path_ok = match w.signatures.get(internal_key) {
+                Some(sig) => verifier.verify_signature(internal_key, sig, &message),
+                None => false,
+            };
+            if key_path_ok {
+                return Ok(true);
+            }
+            // Script-path fallback: evaluate the body if present. `tr(K)` (no body) without a valid
+            // key-path signature is unsatisfiable.
+            match body {
+                Some(b) => eval_b(b, &d.constants, b, op, st, w, verifier),
+                None => Ok(false),
+            }
+        }
+    }
 }
 
 /// Evaluate a boolean term to a verdict.

@@ -49,11 +49,15 @@ pub fn admit<Pk: MiniscriptKey>(
     d: &Descriptor<Pk>,
     caps: &CapabilitySet,
 ) -> Result<(), AdmissionError> {
-    if !d.body.has_depth_at_most(MAX_DEPTH) {
-        return Err(AdmissionError::TooDeep);
+    // `tr(K)` has no body and is trivially admissible (the key isn't a tree). For wsh and tr-with-
+    // body, the body is checked the same way.
+    if let Some(body) = d.body() {
+        if !body.has_depth_at_most(MAX_DEPTH) {
+            return Err(AdmissionError::TooDeep);
+        }
+        check_polarity(body, true)?;
+        check_b(body, caps, &d.constants)?;
     }
-    check_polarity(&d.body, true)?;
-    check_b(&d.body, caps, &d.constants)?;
     Ok(())
 }
 

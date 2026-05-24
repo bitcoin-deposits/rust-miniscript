@@ -19,7 +19,7 @@ use core::str::FromStr;
 use crate::prelude::*;
 use crate::MiniscriptKey;
 
-use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::ast::{BTerm, Descriptor, Obligation, Scheme, VTerm};
 use super::encode::is_canonical_name;
 use super::limits::MAX_DEPTH;
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
@@ -268,6 +268,68 @@ impl<'a> Parser<'a> {
     where
         Pk: MiniscriptKey + FromStr,
     {
+        // Look at the leading word for a scheme wrapper. `wsh(...)` and `tr(...)` are recognized;
+        // anything else (including a bare body or a `with(...)` at the top) is implicitly wsh for
+        // backward compatibility.
+        if let Some(Tok::Word(w)) = self.peek() {
+            match w.as_str() {
+                "wsh" => return self.parse_wsh::<Pk>(),
+                "tr" => return self.parse_tr::<Pk>(),
+                _ => {}
+            }
+        }
+        let (constants, body) = self.parse_with_or_bare()?;
+        Ok(Descriptor { constants, scheme: Scheme::Wsh { body } })
+    }
+
+    /// `wsh( <with-or-bare-body> )` — explicit wrapper for the default scheme.
+    fn parse_wsh<Pk>(&mut self) -> Result<Descriptor<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        self.pos += 1; // consume "wsh"
+        self.expect(&Tok::LParen)?;
+        let (constants, body) = self.parse_with_or_bare()?;
+        self.expect(&Tok::RParen)?;
+        Ok(Descriptor { constants, scheme: Scheme::Wsh { body } })
+    }
+
+    /// `tr( KEY )` or `tr( KEY, <with-or-bare-body> )`.
+    fn parse_tr<Pk>(&mut self) -> Result<Descriptor<Pk>, ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
+        self.pos += 1; // consume "tr"
+        self.expect(&Tok::LParen)?;
+        // Internal key — a bare word that resolves via Pk::from_str. There is no `with(...)`
+        // binding for the internal key; tr's K slot is a key literal by construction.
+        let key_word = self.word()?;
+        let internal_key = Pk::from_str(&key_word)
+            .map_err(|_| ParseError { message: format!("tr internal key `{}` is not a valid key", key_word) })?;
+        let body = if matches!(self.peek(), Some(Tok::Comma)) {
+            self.pos += 1;
+            let (constants_for_body, body) = self.parse_with_or_bare()?;
+            self.expect(&Tok::RParen)?;
+            // Constants from the body's `with(...)` are part of the descriptor.
+            return Ok(Descriptor {
+                constants: constants_for_body,
+                scheme: Scheme::Tr { internal_key, body: Some(body) },
+            });
+        } else {
+            None
+        };
+        self.expect(&Tok::RParen)?;
+        Ok(Descriptor {
+            constants: BTreeMap::new(),
+            scheme: Scheme::Tr { internal_key, body },
+        })
+    }
+
+    /// `with(name = val, ..., in body)` or just `body` — common to wsh and tr's body slot.
+    fn parse_with_or_bare<Pk>(&mut self) -> Result<(BTreeMap<String, Value<Pk>>, BTerm<Pk>), ParseError>
+    where
+        Pk: MiniscriptKey + FromStr,
+    {
         if matches!(self.peek(), Some(Tok::Word(w)) if w == "with") {
             self.pos += 1;
             self.expect(&Tok::LParen)?;
@@ -289,10 +351,10 @@ impl<'a> Parser<'a> {
             self.bound = constants.keys().cloned().collect();
             let body = self.bterm()?;
             self.expect(&Tok::RParen)?;
-            Ok(Descriptor { constants, body })
+            Ok((constants, body))
         } else {
             let body = self.bterm()?;
-            Ok(Descriptor { constants: BTreeMap::new(), body })
+            Ok((BTreeMap::new(), body))
         }
     }
 
@@ -815,7 +877,7 @@ mod tests {
             Some(Value::List(ks)) => assert_eq!(ks.len(), 3),
             other => panic!("guardians not a 3-list: {:?}", other),
         }
-        match &d.body {
+        match d.body().unwrap() {
             BTerm::Match { arms, .. } => assert_eq!(arms.len(), 4), // spend/insert/replace/delete
             other => panic!("body not a match: {:?}", other),
         }
@@ -826,7 +888,7 @@ mod tests {
         let d = parse_ok(ORACLE);
         assert_eq!(d.constants.len(), 4);
         // The rebalancer branch carries an oracle attestation with a 50bps schema.
-        let found = format!("{:?}", d.body).contains("PriceWithinBps { tolerance_bps: 50 }");
+        let found = format!("{:?}", d.body().unwrap()).contains("PriceWithinBps { tolerance_bps: 50 }");
         assert!(found, "expected a 50bps price schema in the parsed body");
     }
 
@@ -850,6 +912,6 @@ mod tests {
     fn parses_bare_expression_without_with() {
         let d = parse::<String>("prove(pk(user_key))").unwrap();
         assert!(d.constants.is_empty());
-        assert!(matches!(d.body, BTerm::Prove(Obligation::Pk(_))));
+        assert!(matches!(d.body().unwrap(), BTerm::Prove(Obligation::Pk(_))));
     }
 }

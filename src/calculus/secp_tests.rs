@@ -131,7 +131,7 @@ fn real_pk_h_matches_hash160_of_the_key() {
     use bitcoin::hashes::Hash as _;
     let keyhash = HashValue::Hash160(pk.pubkey_hash().to_byte_array());
     let body = BTerm::Prove(Obligation::PkH(VTerm::Lit(Value::Hash(keyhash))));
-    let d = Descriptor { constants: BTreeMap::new(), body };
+    let d = Descriptor::wsh(BTreeMap::new(), body);
 
     let op = Op { ty: "spend", amount: 100 };
     let msg = super::encode::operation_preimage(&op);

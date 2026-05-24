@@ -14,7 +14,7 @@ use crate::prelude::*;
 use crate::MiniscriptKey;
 
 use super::admission::{admit, AdmissionError};
-use super::ast::{BTerm, Descriptor};
+use super::ast::{BTerm, Descriptor, Scheme};
 use super::capability::CapabilitySet;
 use super::host::Operation;
 use super::limits::MAX_DEPTH;
@@ -198,19 +198,30 @@ where
     O: Operation<Pk>,
 {
     let path = op.path().ok_or(ModifyError::MissingArg("path"))?;
-    let body = match op.op_type().as_str() {
+    let current_body =
+        current.body().ok_or(ModifyError::MissingArg("body"))?; // tr(K) has no body to modify
+    let new_body = match op.op_type().as_str() {
         "replace" => {
             let sub = op.subtree().ok_or(ModifyError::MissingArg("subtree"))?;
-            replace_at(&current.body, &path, sub)?
+            replace_at(current_body, &path, sub)?
         }
         "insert" => {
             let sub = op.subtree().ok_or(ModifyError::MissingArg("subtree"))?;
-            insert_at(&current.body, &path, sub)?
+            insert_at(current_body, &path, sub)?
         }
-        "delete" => delete_at(&current.body, &path)?,
+        "delete" => delete_at(current_body, &path)?,
         other => return Err(ModifyError::NotAModification(other.to_string())),
     };
-    Ok(Descriptor { constants: current.constants.clone(), body })
+    // Preserve the scheme; only the body changes. The internal key of a `tr(...)` is structural
+    // and is not modifiable through ast operations.
+    let scheme = match &current.scheme {
+        Scheme::Wsh { .. } => Scheme::Wsh { body: new_body },
+        Scheme::Tr { internal_key, .. } => Scheme::Tr {
+            internal_key: internal_key.clone(),
+            body: Some(new_body),
+        },
+    };
+    Ok(Descriptor { constants: current.constants.clone(), scheme })
 }
 
 /// Compute the candidate descriptor and re-run admission on it. Returns the new descriptor only if

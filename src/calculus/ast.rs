@@ -161,11 +161,51 @@ impl<Pk: MiniscriptKey> Obligation<Pk> {
     }
 }
 
-/// A complete descriptor: a `with(...)` constant environment together with a body of sort `B`.
+/// A complete descriptor: a `with(...)` constant environment together with a scheme.
+///
+/// The scheme is the outer wrapper — `wsh(...)` for whole-body authorization (today's default), or
+/// `tr(K)` / `tr(K, BODY)` for an internal-key path with an optional script-path body. The scheme
+/// is part of the descriptor's identity (its `descriptor_id` differs across schemes) so that an
+/// encoding under one scheme cannot be replayed as another.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Descriptor<Pk: MiniscriptKey> {
     /// Named constants, bound once at deposit-open.
     pub constants: BTreeMap<String, Value<Pk>>,
-    /// The authorization term.
-    pub body: BTerm<Pk>,
+    /// The outer wrapper that determines commitment shape and authorization paths.
+    pub scheme: Scheme<Pk>,
+}
+
+/// The outer wrapper of a descriptor, in the style of bitcoin miniscript's `wsh(...)` / `tr(...)`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Scheme<Pk: MiniscriptKey> {
+    /// Whole-body authorization: the descriptor's body holds the authorization term, fully
+    /// revealed in fraud proofs. The default and what existed before schemes were introduced.
+    Wsh {
+        /// The authorization term.
+        body: BTerm<Pk>,
+    },
+    /// An internal key plus an optional script-path body. `K` can authorize any operation by
+    /// signing; if `body` is present, it provides additional script-path authorizations equivalent
+    /// to `or(pk(K), body)`. With no body, only the key-path can authorize.
+    Tr {
+        /// The internal key — a universal authorization path that bypasses the body.
+        internal_key: Pk,
+        /// Optional script-path body. `tr(K)` has none; `tr(K, BODY)` has Some.
+        body: Option<BTerm<Pk>>,
+    },
+}
+
+impl<Pk: MiniscriptKey> Descriptor<Pk> {
+    /// The descriptor's body term, if any. `tr(K)` (key-path only) has none.
+    pub fn body(&self) -> Option<&BTerm<Pk>> {
+        match &self.scheme {
+            Scheme::Wsh { body } => Some(body),
+            Scheme::Tr { body, .. } => body.as_ref(),
+        }
+    }
+
+    /// Convenience constructor for `wsh(...)` — the default scheme.
+    pub fn wsh(constants: BTreeMap<String, Value<Pk>>, body: BTerm<Pk>) -> Self {
+        Descriptor { constants, scheme: Scheme::Wsh { body } }
+    }
 }

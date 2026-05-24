@@ -298,7 +298,7 @@ mod admission_tests {
     fn capability_gates_state_predicates() {
         // A descriptor using amount_at_most_pct is admitted only if the operator declares it.
         let body: BTerm<Pk> = BTerm::State(StatePred::AmountAtMostPct, vec![VTerm::Lit(Value::Int(10))]);
-        let d = Descriptor { constants: BTreeMap::new(), body };
+        let d = Descriptor::wsh(BTreeMap::new(), body);
         assert!(admit(&d, &CapabilitySet::everything()).is_ok());
         assert_eq!(
             admit(&d, &CapabilitySet::minimum()),
@@ -310,7 +310,7 @@ mod admission_tests {
     fn unresolved_constant_is_rejected() {
         // pk(missing) where `missing` is not bound by with(...).
         let body: BTerm<Pk> = BTerm::Prove(Obligation::Pk(VTerm::Var("missing".to_string())));
-        let d = Descriptor { constants: BTreeMap::new(), body };
+        let d = Descriptor::wsh(BTreeMap::new(), body);
         assert_eq!(
             admit(&d, &CapabilitySet::everything()),
             Err(AdmissionError::UnresolvedVar("missing".to_string())),
@@ -404,7 +404,7 @@ mod monotonicity {
 
         for _ in 0..500 {
             let body = gen(4, &mut rng);
-            let d = Descriptor { constants: BTreeMap::new(), body };
+            let d = Descriptor::wsh(BTreeMap::new(), body);
             if admit(&d, &caps).is_err() {
                 rejected += 1;
                 continue;
@@ -412,15 +412,15 @@ mod monotonicity {
             admitted += 1;
             // For every pair m ⊆ m', accept(m) ⟹ accept(m').
             for m in 0u8..16 {
-                if !accept(&d.body, m) {
+                if !accept(d.body().unwrap(), m) {
                     continue;
                 }
                 for m2 in 0u8..16 {
                     if m & m2 == m {
                         assert!(
-                            accept(&d.body, m2),
+                            accept(d.body().unwrap(), m2),
                             "monotonicity violated: accepts {:04b} but not superset {:04b}\nterm: {:?}",
-                            m, m2, d.body,
+                            m, m2, d.body().unwrap(),
                         );
                     }
                 }
@@ -466,7 +466,7 @@ mod proofs {
         let digest = HashValue::Sha256(sha256::Hash::hash(&preimage).to_byte_array());
         let body: BTerm<Pk> =
             BTerm::Prove(Obligation::Hashlock(VTerm::Lit(Value::Hash(digest.clone()))));
-        let d = Descriptor { constants: BTreeMap::new(), body };
+        let d = Descriptor::wsh(BTreeMap::new(), body);
         let op = MockOp::spend(1, "x");
         let st = MockLedger::default();
 
@@ -489,7 +489,7 @@ mod proofs {
         let keyhash = HashValue::Hash160(hash160::Hash::hash(key.as_bytes()).to_byte_array());
         let body: BTerm<Pk> =
             BTerm::Prove(Obligation::PkH(VTerm::Lit(Value::Hash(keyhash))));
-        let d = Descriptor { constants: BTreeMap::new(), body };
+        let d = Descriptor::wsh(BTreeMap::new(), body);
         let op = MockOp::spend(1, "x");
         let st = MockLedger::default();
 
@@ -574,7 +574,7 @@ mod modification {
             )],
             default: Box::new(BTerm::Const(false)),
         };
-        Descriptor { constants, body }
+        Descriptor::wsh(constants, body)
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod modification {
         let op = MockOp::replace(vec![0], pk("K2"));
         let cand = candidate(&d, &op).expect("candidate");
         // The targeted subterm is now pk(K2).
-        assert_eq!(cand.body.subterm_at(&[0]), Some(&pk("K2")));
+        assert_eq!(cand.body().unwrap().subterm_at(&[0]), Some(&pk("K2")));
         // The new descriptor is admissible.
         assert!(admit_modification(&d, &op, &CapabilitySet::everything()).is_ok());
     }
@@ -621,7 +621,7 @@ mod modification {
             ],
         );
         let body = BTerm::And(vec![leaf, shape_check, subtree_check]);
-        let d = Descriptor { constants: BTreeMap::new(), body };
+        let d = Descriptor::wsh(BTreeMap::new(), body);
         let op = MockOp::spend(1, "x");
         let st = MockLedger::default();
         let w = witness_signed_by(&op, &["K1"]);
@@ -773,11 +773,13 @@ mod codec {
     }
 
     #[test]
-    fn bad_version_is_rejected() {
+    fn unknown_scheme_byte_is_rejected() {
+        // The leading byte now selects the scheme (0x01 wsh, 0x02 tr); an unknown value is
+        // rejected. Use 0xff which is guaranteed never to be a valid scheme.
         let d = parse::<Pk>("prove(pk(K1))").unwrap();
         let mut bytes = encode_descriptor(&d);
-        bytes[0] = 0x02;
-        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::BadVersion(2)));
+        bytes[0] = 0xff;
+        assert_eq!(decode_descriptor::<Pk>(&bytes), Err(DecodeError::BadVersion(0xff)));
     }
 
     #[test]
@@ -845,7 +847,7 @@ mod hash_literals {
 
         // Parses to a hashlock obligation.
         let d = parse::<Pk>(&src).unwrap();
-        assert!(matches!(d.body, BTerm::Prove(Obligation::Hashlock(_))));
+        assert!(matches!(d.body().unwrap(), BTerm::Prove(Obligation::Hashlock(_))));
 
         // Evaluates: revealing the preimage authorizes; absence does not.
         let op = MockOp::spend(1, "x");
@@ -1154,7 +1156,7 @@ mod templates {
           branch(else, false)
         ))";
 
-    fn clause(src: &str) -> super::super::ast::BTerm<Pk> { parse::<Pk>(src).unwrap().body }
+    fn clause(src: &str) -> super::super::ast::BTerm<Pk> { parse::<Pk>(src).unwrap().body().unwrap().clone() }
 
     #[test]
     fn social_recovery_authorizes_and_applies() {
@@ -1174,7 +1176,7 @@ mod templates {
         // The modification produces a well-formed descriptor with the owner clause replaced.
         let d = parse::<Pk>(SOCIAL_RECOVERY).unwrap();
         let updated = admit_modification(&d, &op, &CapabilitySet::everything()).expect("admitted");
-        assert_eq!(updated.body.subterm_at(&[0]), Some(&new_owner));
+        assert_eq!(updated.body().unwrap().subterm_at(&[0]), Some(&new_owner));
     }
 
     // ----- linear vesting ----------------------------------------------------------------------
@@ -1379,7 +1381,7 @@ mod hardening {
     #[test]
     fn admit_rejects_overdeep_term() {
         let body = nest_not(MAX_DEPTH + 10);
-        let d: Descriptor<Pk> = Descriptor { constants: BTreeMap::new(), body };
+        let d: Descriptor<Pk> = Descriptor::wsh(BTreeMap::new(), body);
         assert_eq!(admit(&d, &CapabilitySet::everything()), Err(AdmissionError::TooDeep));
     }
 
@@ -1387,7 +1389,7 @@ mod hardening {
     fn admit_accepts_at_the_limit() {
         // A term right at MAX_DEPTH should still admit (not under MAX_DEPTH + 1 levels of not).
         let body = nest_not(MAX_DEPTH - 1); // depth = MAX_DEPTH (MAX_DEPTH - 1 nots + leaf)
-        let d: Descriptor<Pk> = Descriptor { constants: BTreeMap::new(), body };
+        let d: Descriptor<Pk> = Descriptor::wsh(BTreeMap::new(), body);
         assert!(admit(&d, &CapabilitySet::everything()).is_ok());
     }
 }
@@ -1417,7 +1419,7 @@ mod parser_edges {
         assert_eq!(d.constants.get("adj"), Some(&Value::Int(-100)));
         // And inside an expression position.
         let d2 = parse::<Pk>("cmp(<=, -100, 100)").unwrap();
-        assert!(matches!(d2.body, BTerm::Cmp(_, _, _)));
+        assert!(matches!(d2.body().unwrap(), BTerm::Cmp(_, _, _)));
     }
 }
 
@@ -1793,7 +1795,7 @@ mod roundtrip_properties {
             let v = if for_source { src_value(2, rng) } else { any_value(2, rng) };
             constants.insert(name.to_string(), v);
         }
-        Descriptor { constants, body: gen_bterm(d, rng, for_source) }
+        Descriptor::wsh(constants, gen_bterm(d, rng, for_source))
     }
 
     /// Record every BTerm head constructor encountered, so the test can assert it actually
@@ -1822,7 +1824,7 @@ mod roundtrip_properties {
                 continue;
             }
             admitted += 1;
-            note_shapes(&mut shapes, &d.body);
+            note_shapes(&mut shapes, d.body().unwrap());
             let bytes = encode_descriptor(&d);
             let back = decode_descriptor::<Pk>(&bytes).expect("decode");
             assert_eq!(d, back, "decode produced a different descriptor");
@@ -1846,7 +1848,7 @@ mod roundtrip_properties {
                 continue;
             }
             admitted += 1;
-            note_shapes(&mut shapes, &d.body);
+            note_shapes(&mut shapes, d.body().unwrap());
             let printed = to_string(&d);
             let back = parse::<Pk>(&printed)
                 .unwrap_or_else(|e| panic!("re-parse failed for `{}`: {}", printed, e));
@@ -1932,9 +1934,9 @@ mod boring_surface {
         let a = parse::<Pk>("pk(K1)").unwrap();
         let b = parse::<Pk>("prove(pk(K1))").unwrap();
         assert_eq!(a, b);
-        assert!(matches!(a.body, BTerm::Prove(Obligation::Pk(_))));
-        // Printer emits the boring form.
-        assert_eq!(to_string(&a), "pk(K1)");
+        assert!(matches!(a.body().unwrap(), BTerm::Prove(Obligation::Pk(_))));
+        // Printer emits the boring form, wrapped in the default scheme.
+        assert_eq!(to_string(&a), "wsh(pk(K1))");
     }
 
     #[test]
@@ -1955,8 +1957,8 @@ mod boring_surface {
             ("ge(1, 2)", CmpOp::Ge),
         ] {
             let d = parse::<Pk>(src).unwrap();
-            match d.body {
-                BTerm::Cmp(op, _, _) => assert_eq!(op, expected, "wrong op for `{}`", src),
+            match d.body().unwrap() {
+                BTerm::Cmp(op, _, _) => assert_eq!(*op, expected, "wrong op for `{}`", src),
                 other => panic!("expected Cmp, got {:?} for `{}`", other, src),
             }
         }
@@ -1964,7 +1966,7 @@ mod boring_surface {
         let legacy = parse::<Pk>("cmp(<=, 1, 2)").unwrap();
         let direct = parse::<Pk>("le(1, 2)").unwrap();
         assert_eq!(legacy, direct);
-        assert_eq!(to_string(&legacy), "le(1, 2)");
+        assert_eq!(to_string(&legacy), "wsh(le(1, 2))");
     }
 
     #[test]
@@ -1976,5 +1978,114 @@ mod boring_surface {
         assert_eq!(func, colon);
         // Printer emits the function-call form.
         assert!(to_string(&func).contains("sha256(0x"));
+    }
+}
+
+mod wrappers {
+    //! `wsh(...)` / `tr(K)` / `tr(K, BODY)` wrappers, mirroring bitcoin miniscript's surface.
+    //! `wsh` is the default scheme; `tr` introduces an internal key that can authorize any
+    //! operation via the key-path, independent of the body.
+    use super::*;
+    use crate::calculus::admission::admit;
+    use crate::calculus::ast::{BTerm, Descriptor, Obligation, Scheme};
+    use crate::calculus::capability::CapabilitySet;
+    use crate::calculus::encode::{
+        decode_descriptor, descriptor_id, encode_descriptor, to_string,
+    };
+
+    #[test]
+    fn bare_body_parses_as_wsh() {
+        // Backward compat: a top-level body without a wrapper implicitly becomes wsh(body).
+        let bare = parse::<Pk>("pk(K1)").unwrap();
+        let wrapped = parse::<Pk>("wsh(pk(K1))").unwrap();
+        assert_eq!(bare, wrapped);
+        assert!(matches!(bare.scheme, Scheme::Wsh { .. }));
+    }
+
+    #[test]
+    fn tr_with_body_parses_and_round_trips() {
+        let d = parse::<Pk>("tr(K1, pk(K2))").unwrap();
+        match &d.scheme {
+            Scheme::Tr { internal_key, body: Some(b) } => {
+                assert_eq!(internal_key, "K1");
+                assert!(matches!(b, BTerm::Prove(Obligation::Pk(_))));
+            }
+            other => panic!("expected Tr with body, got {:?}", other),
+        }
+        // Source round-trip.
+        let printed = to_string(&d);
+        assert_eq!(printed, "tr(K1, pk(K2))");
+        assert_eq!(d, parse::<Pk>(&printed).unwrap());
+        // Bytes round-trip.
+        let bytes = encode_descriptor(&d);
+        assert_eq!(d, decode_descriptor::<Pk>(&bytes).unwrap());
+    }
+
+    #[test]
+    fn tr_without_body_parses_and_round_trips() {
+        let d = parse::<Pk>("tr(K1)").unwrap();
+        assert!(matches!(&d.scheme, Scheme::Tr { body: None, .. }));
+        let printed = to_string(&d);
+        assert_eq!(printed, "tr(K1)");
+        assert_eq!(d, parse::<Pk>(&printed).unwrap());
+        let bytes = encode_descriptor(&d);
+        assert_eq!(d, decode_descriptor::<Pk>(&bytes).unwrap());
+    }
+
+    #[test]
+    fn tr_key_path_authorizes_any_operation() {
+        // `tr(K)` — only the key-path. Sign with K, and any operation type is authorized.
+        let d = parse::<Pk>("tr(K1)").unwrap();
+        let spend = MockOp::spend(100, "anywhere");
+        let modify = MockOp::of_type("insert");
+        assert!(decide_descriptor(&d, &spend, &MockLedger::default(), &["K1"]));
+        assert!(decide_descriptor(&d, &modify, &MockLedger::default(), &["K1"]));
+        // Without K1's signature, nothing is authorized.
+        assert!(!decide_descriptor(&d, &spend, &MockLedger::default(), &[]));
+    }
+
+    #[test]
+    fn tr_falls_through_to_body_when_key_absent() {
+        // `tr(K1, pk(K2))` — K1 is key-path, K2 is script-path.
+        let d = parse::<Pk>("tr(K1, pk(K2))").unwrap();
+        let op = MockOp::spend(1, "x");
+        // K1 alone authorizes (key-path).
+        assert!(decide_descriptor(&d, &op, &MockLedger::default(), &["K1"]));
+        // K2 alone authorizes (script-path).
+        assert!(decide_descriptor(&d, &op, &MockLedger::default(), &["K2"]));
+        // Neither: rejected.
+        assert!(!decide_descriptor(&d, &op, &MockLedger::default(), &["K3"]));
+    }
+
+    #[test]
+    fn descriptor_id_differs_across_schemes() {
+        // wsh(BODY) and tr(K, BODY) commit to different ids — scheme confusion can't slip past.
+        let same_body = "pk(K2)";
+        let wsh = parse::<Pk>(&format!("wsh({})", same_body)).unwrap();
+        let tr_with = parse::<Pk>(&format!("tr(K1, {})", same_body)).unwrap();
+        let tr_alone = parse::<Pk>("tr(K1)").unwrap();
+        let tr_other_key = parse::<Pk>(&format!("tr(K9, {})", same_body)).unwrap();
+        assert_ne!(descriptor_id(&wsh), descriptor_id(&tr_with));
+        assert_ne!(descriptor_id(&wsh), descriptor_id(&tr_alone));
+        assert_ne!(descriptor_id(&tr_with), descriptor_id(&tr_alone));
+        assert_ne!(descriptor_id(&tr_with), descriptor_id(&tr_other_key));
+    }
+
+    #[test]
+    fn tr_without_body_admits_without_running_polarity() {
+        // `tr(K)` has no body; polarity/capability checks pass trivially.
+        let d = parse::<Pk>("tr(K1)").unwrap();
+        assert!(admit(&d, &CapabilitySet::everything()).is_ok());
+    }
+
+    /// Like `decide`, but takes a parsed `Descriptor` and uses `evaluate` directly.
+    fn decide_descriptor(
+        d: &Descriptor<Pk>,
+        op: &MockOp,
+        st: &MockLedger,
+        signers: &[&str],
+    ) -> bool {
+        let w = witness_signed_by(op, signers);
+        evaluate(d, op, st, &w, &MockVerifier).expect("eval")
     }
 }

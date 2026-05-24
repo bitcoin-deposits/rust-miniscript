@@ -17,7 +17,7 @@ use core::fmt::Display;
 use crate::prelude::*;
 use crate::MiniscriptKey;
 
-use super::ast::{BTerm, Descriptor, Obligation, VTerm};
+use super::ast::{BTerm, Descriptor, Obligation, Scheme, VTerm};
 use super::fraud::FraudProof;
 use super::host::Operation;
 use super::limits::MAX_DEPTH;
@@ -81,21 +81,48 @@ pub fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
 /// The canonical source form of a descriptor.
 pub fn to_string<Pk: MiniscriptKey + Display>(d: &Descriptor<Pk>) -> String {
     let mut out = String::new();
-    if d.constants.is_empty() {
-        write_b(&mut out, &d.body);
-    } else {
+    match &d.scheme {
+        Scheme::Wsh { body } => {
+            out.push_str("wsh(");
+            write_with_or_bare(&mut out, &d.constants, Some(body));
+            out.push(')');
+        }
+        Scheme::Tr { internal_key, body } => {
+            out.push_str("tr(");
+            out.push_str(&internal_key.to_string());
+            if let Some(b) = body {
+                out.push_str(", ");
+                write_with_or_bare(&mut out, &d.constants, Some(b));
+            }
+            out.push(')');
+        }
+    }
+    out
+}
+
+/// Write a `with(...)` block if there are constants, or just the body otherwise. Shared between
+/// the wsh and tr printers.
+fn write_with_or_bare<Pk: MiniscriptKey + Display>(
+    out: &mut String,
+    constants: &BTreeMap<String, Value<Pk>>,
+    body: Option<&BTerm<Pk>>,
+) {
+    if !constants.is_empty() {
         out.push_str("with(");
-        for (name, value) in &d.constants {
+        for (name, value) in constants {
             out.push_str(name);
             out.push_str(" = ");
-            write_value(&mut out, value);
+            write_value(out, value);
             out.push_str(", ");
         }
         out.push_str("in ");
-        write_b(&mut out, &d.body);
+        if let Some(b) = body {
+            write_b(out, b);
+        }
         out.push(')');
+    } else if let Some(b) = body {
+        write_b(out, b);
     }
-    out
 }
 
 fn write_list<T>(out: &mut String, items: &[T], mut each: impl FnMut(&mut String, &T)) {
@@ -542,17 +569,49 @@ fn put_schema(out: &mut Vec<u8>, schema: &Schema) {
     }
 }
 
+/// Scheme tag values for the canonical encoding.
+const SCHEME_WSH: u8 = 0x01;
+const SCHEME_TR: u8 = 0x02;
+
 /// The dep-17 canonical byte encoding of a descriptor.
+///
+/// Layout: a single scheme byte followed by the scheme-specific payload. `wsh(0x01)` encodes the
+/// constants list and body term; `tr(0x02)` encodes the internal key's canonical bytes, the
+/// constants list, a body-present flag, and (if present) the body term. The scheme byte is part of
+/// the hash preimage, so a descriptor under one scheme cannot be replayed as another.
 pub fn encode_descriptor<Pk: MiniscriptKey + CanonicalKey>(d: &Descriptor<Pk>) -> Vec<u8> {
-    let mut out = vec![0x01]; // version
-    put_u32(&mut out, d.constants.len() as u32);
-    // BTreeMap iterates in sorted key order, giving the required canonical order.
-    for (name, value) in &d.constants {
-        put_bytes(&mut out, name.as_bytes());
-        put_value(&mut out, value);
+    let mut out = Vec::new();
+    match &d.scheme {
+        Scheme::Wsh { body } => {
+            out.push(SCHEME_WSH);
+            put_constants(&mut out, &d.constants);
+            put_term(&mut out, body);
+        }
+        Scheme::Tr { internal_key, body } => {
+            out.push(SCHEME_TR);
+            put_bytes(&mut out, &internal_key.to_canonical_bytes());
+            put_constants(&mut out, &d.constants);
+            match body {
+                Some(b) => {
+                    out.push(0x01);
+                    put_term(&mut out, b);
+                }
+                None => out.push(0x00),
+            }
+        }
     }
-    put_term(&mut out, &d.body);
     out
+}
+
+fn put_constants<Pk: MiniscriptKey + CanonicalKey>(
+    out: &mut Vec<u8>,
+    constants: &BTreeMap<String, Value<Pk>>,
+) {
+    put_u32(out, constants.len() as u32);
+    for (name, value) in constants {
+        put_bytes(out, name.as_bytes());
+        put_value(out, value);
+    }
 }
 
 /// The descriptor commitment: `tagged_hash("dep17/descriptor", encode_descriptor(d))`.
@@ -991,10 +1050,34 @@ pub fn decode_descriptor<Pk: MiniscriptKey + CanonicalKey>(
     buf: &[u8],
 ) -> Result<Descriptor<Pk>, DecodeError> {
     let mut d = Decoder::new(buf);
-    let version = d.u8()?;
-    if version != 0x01 {
-        return Err(DecodeError::BadVersion(version));
-    }
+    let scheme_byte = d.u8()?;
+    let descriptor = match scheme_byte {
+        SCHEME_WSH => {
+            let constants = dec_constants(&mut d)?;
+            let body = dec_term(&mut d, 0)?;
+            Descriptor { constants, scheme: Scheme::Wsh { body } }
+        }
+        SCHEME_TR => {
+            let key_bytes = d.bytes()?;
+            let internal_key =
+                Pk::from_canonical_bytes(&key_bytes).ok_or(DecodeError::BadKey)?;
+            let constants = dec_constants(&mut d)?;
+            let body = match d.u8()? {
+                0 => None,
+                1 => Some(dec_term(&mut d, 0)?),
+                other => return Err(DecodeError::NonCanonicalBool(other)),
+            };
+            Descriptor { constants, scheme: Scheme::Tr { internal_key, body } }
+        }
+        other => return Err(DecodeError::BadVersion(other)),
+    };
+    d.finish()?;
+    Ok(descriptor)
+}
+
+fn dec_constants<Pk: MiniscriptKey + CanonicalKey>(
+    d: &mut Decoder,
+) -> Result<BTreeMap<String, Value<Pk>>, DecodeError> {
     let n = d.list_count()?;
     let mut constants = BTreeMap::new();
     let mut prev: Option<String> = None;
@@ -1003,19 +1086,16 @@ pub fn decode_descriptor<Pk: MiniscriptKey + CanonicalKey>(
         if !is_canonical_name(&name) {
             return Err(DecodeError::InvalidName);
         }
-        // Strictly increasing names enforce both sorted order and uniqueness.
         if let Some(prev) = &prev {
             if &name <= prev {
                 return Err(DecodeError::NonCanonicalOrder);
             }
         }
-        let value = dec_value(&mut d, 0)?;
+        let value = dec_value(d, 0)?;
         prev = Some(name.clone());
         constants.insert(name, value);
     }
-    let body = dec_term(&mut d, 0)?;
-    d.finish()?;
-    Ok(Descriptor { constants, body })
+    Ok(constants)
 }
 
 // ----------------------------------------------------------------------------------------------
