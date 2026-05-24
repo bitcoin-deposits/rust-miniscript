@@ -15,7 +15,7 @@
 use crate::prelude::*;
 use crate::MiniscriptKey;
 
-use super::ast::{BTerm, Descriptor, Obligation, Scheme, VTerm};
+use super::ast::{BTerm, Descriptor, DescriptorNode, Obligation, Scheme, VTerm};
 use super::encode::{operation_preimage, CanonicalKey};
 use super::host::{LedgerState, Operation};
 use super::registry::{CmpOp, StatePred, Symbol, ValueFn};
@@ -58,7 +58,7 @@ where
     V: Verifier<Pk>,
 {
     match &d.scheme {
-        Scheme::Wsh { body } => eval_b(body, &d.constants, body, op, st, w, verifier),
+        Scheme::Wsh { body } => eval_b(body, &d.constants, d, op, st, w, verifier),
         Scheme::Tr { internal_key, body } => {
             // Key-path: a signature by `internal_key` over the operation authorizes anything,
             // without touching the body. This is the bitcoin-taproot key-path's privacy benefit:
@@ -74,7 +74,7 @@ where
             // Script-path fallback: evaluate the body if present. `tr(K)` (no body) without a valid
             // key-path signature is unsatisfiable.
             match body {
-                Some(b) => eval_b(b, &d.constants, b, op, st, w, verifier),
+                Some(b) => eval_b(b, &d.constants, d, op, st, w, verifier),
                 None => Ok(false),
             }
         }
@@ -91,7 +91,7 @@ where
 pub fn eval_b<Pk, O, L, V>(
     t: &BTerm<Pk>,
     env: &Env<Pk>,
-    root: &BTerm<Pk>,
+    root: &Descriptor<Pk>,
     op: &O,
     st: &L,
     w: &Witness<Pk>,
@@ -168,7 +168,7 @@ where
 pub fn eval_v<Pk, O, L>(
     t: &VTerm<Pk>,
     env: &Env<Pk>,
-    root: &BTerm<Pk>,
+    root: &Descriptor<Pk>,
     op: &O,
     st: &L,
 ) -> Result<Value<Pk>, EvalError>
@@ -188,7 +188,7 @@ fn eval_valuefn<Pk, O, L>(
     f: ValueFn,
     args: &[VTerm<Pk>],
     env: &Env<Pk>,
-    root: &BTerm<Pk>,
+    root: &Descriptor<Pk>,
     op: &O,
     st: &L,
 ) -> Result<Value<Pk>, EvalError>
@@ -252,15 +252,21 @@ where
         }
         ValueFn::AstRef => {
             let p = path_arg(0)?;
-            root.subterm_at(&p)
-                .map(|s| Value::Subtree(Box::new(s.clone())))
-                .ok_or(EvalError::PathOutOfRange)
+            match root.node_at(&p) {
+                Some(DescriptorNode::Body(s)) => Ok(Value::Subtree(Box::new(s.clone()))),
+                Some(DescriptorNode::InternalKey(k)) => Ok(Value::Key(k.clone())),
+                None => Err(EvalError::PathOutOfRange),
+            }
         }
         ValueFn::AstShapeAt => {
             let p = path_arg(0)?;
-            root.subterm_at(&p)
-                .map(|s| Value::Symbol(Symbol::new(s.shape())))
-                .ok_or(EvalError::PathOutOfRange)
+            match root.node_at(&p) {
+                Some(DescriptorNode::Body(s)) => Ok(Value::Symbol(Symbol::new(s.shape()))),
+                Some(DescriptorNode::InternalKey(_)) => {
+                    Ok(Value::Symbol(Symbol::new("internal_key")))
+                }
+                None => Err(EvalError::PathOutOfRange),
+            }
         }
     }
 }
@@ -269,7 +275,7 @@ where
 pub fn eval_state<Pk, O, L>(
     p: StatePred,
     args: &[Value<Pk>],
-    root: &BTerm<Pk>,
+    root: &Descriptor<Pk>,
     op: &O,
     st: &L,
 ) -> Result<bool, EvalError>
@@ -315,15 +321,21 @@ where
         StatePred::BlocksSinceOpenAtLeast => Ok(st.blocks_since_open() >= arg_int(0)?),
         StatePred::BlocksSinceReceivedAtLeast => Ok(st.blocks_since_received() >= arg_int(0)?),
         StatePred::SubtreeAt => {
-            // subtree_at(candidate, path): is `candidate` structurally the subtree at `path`?
+            // subtree_at(candidate, path): is `candidate` structurally what lives at `path`?
+            // The candidate's kind has to match the kind of the addressed slot: a body subterm
+            // is matched by Value::Subtree; a tr internal key by Value::Key.
             let p = match &args[1] {
                 Value::Path(p) => p,
                 _ => return Err(EvalError::TypeMismatch("subtree_at expects a path")),
             };
-            match (root.subterm_at(p), &args[0]) {
-                (Some(found), Value::Subtree(cand)) => Ok(**cand == *found),
+            match (root.node_at(p), &args[0]) {
+                (Some(DescriptorNode::Body(found)), Value::Subtree(cand)) => Ok(**cand == *found),
+                (Some(DescriptorNode::InternalKey(found)), Value::Key(cand)) => Ok(cand == found),
                 (None, _) => Ok(false),
-                (Some(_), _) => Err(EvalError::TypeMismatch("subtree_at candidate is not a subtree")),
+                // Any other (kind, candidate-kind) pair is well-formed but a structural mismatch:
+                // the candidate's kind doesn't match what's at the address. Return false rather
+                // than erroring, so this is usable as a guard the way the body cases are.
+                _ => Ok(false),
             }
         }
     }
@@ -353,7 +365,7 @@ fn eval_cmp<Pk: MiniscriptKey>(o: CmpOp, a: &Value<Pk>, b: &Value<Pk>) -> Result
 pub fn verify_o<Pk, O, L, V>(
     o: &Obligation<Pk>,
     env: &Env<Pk>,
-    root: &BTerm<Pk>,
+    root: &Descriptor<Pk>,
     w: &Witness<Pk>,
     verifier: &V,
     op: &O,

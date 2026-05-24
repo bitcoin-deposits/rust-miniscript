@@ -29,14 +29,16 @@ wsh(with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
     and(
       prove(pk_threshold(2, guardians)),
       blocks_since_activity_at_least(4320),
-      cmp(=, operation_path(), path(0))
+      cmp(=, operation_path(), path(0, 0))
     )
   )),
   branch(else, false)
 )))
 ```
 
-**Internal-key bypass** — the same policy under `tr(K_super, ...)` adds a master key that can authorize any operation, including descriptor modification, without exercising the body. The same footgun as Bitcoin P2TR: the internal key's custody is a security decision distinct from the script-path keys'.
+Paths are descriptor-rooted: `[0]` selects the body slot of `wsh`, and `[0, 0]` then selects the spend branch's body in the match — the owner's clause. Under `tr` the body root is `[1]` instead (with `[0]` reserved for the internal key), so the same address shifts to `[1, 0]`.
+
+**Internal-key bypass** — the same policy under `tr(K_super, ...)` adds a master key that can authorize any operation, including descriptor modification, without exercising the body. The same footgun as Bitcoin P2TR: the internal key's custody is a security decision distinct from the script-path keys'. The internal key itself is path `[0]` of the descriptor and is rotatable via a `replace` operation at that path.
 
 ```
 tr(K_super, with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
@@ -46,7 +48,7 @@ tr(K_super, with(owner = K1, guardians = [G1, G2, G3], in match(operation_type()
     and(
       prove(pk_threshold(2, guardians)),
       blocks_since_activity_at_least(4320),
-      cmp(=, operation_path(), path(0))
+      cmp(=, operation_path(), path(1, 0))
     )
   )),
   branch(else, false)
@@ -73,7 +75,7 @@ with(beneficiary = K1, allocation = 1000000, vesting_blocks = 52560,
     branch(spend, and(
       prove(pk(beneficiary)),
       cmp(<=,
-        add(cumulative_spent_via(path(0)), operation_arg(amount)),
+        add(cumulative_spent_via(path(0, 0)), operation_arg(amount)),
         div(mul(allocation, min(blocks_since_open(), vesting_blocks)), vesting_blocks)
       )
     )),

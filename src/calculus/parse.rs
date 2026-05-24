@@ -856,7 +856,7 @@ mod tests {
                 and(
                   prove(pk_threshold(3, guardians)),
                   blocks_since_activity_at_least(8640),
-                  cmp(=, operation_path(), path(0))
+                  cmp(=, operation_path(), path(0, 0))
                 )
               )
             ),

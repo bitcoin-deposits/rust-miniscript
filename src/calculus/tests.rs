@@ -87,6 +87,14 @@ impl MockOp {
         args.insert("path".to_string(), Value::Path(path));
         MockOp { ty: "delete", args, nonce: 0 }
     }
+    /// A `replace` operation at a path that addresses a `tr` descriptor's internal key. Carries
+    /// the new key as the `key` argument rather than as `subtree`.
+    fn rotate_key(path: Vec<usize>, new_key: &str) -> Self {
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), Value::Path(path));
+        args.insert("key".to_string(), Value::Key(new_key.to_string()));
+        MockOp { ty: "replace", args, nonce: 0 }
+    }
     fn with_nonce(mut self, nonce: u64) -> Self {
         self.nonce = nonce;
         self
@@ -402,8 +410,9 @@ mod monotonicity {
         let st = MockLedger::default();
         let signers: Vec<&str> = (0..4).filter(|i| mask & (1 << i) != 0).map(|i| KEYS[i]).collect();
         let w = super::witness_signed_by(&op, &signers);
-        let env = BTreeMap::new();
-        eval_b(term, &env, term, &op, &st, &w, &super::MockVerifier).expect("generated terms never error")
+        let d = Descriptor::wsh(BTreeMap::new(), term.clone());
+        eval_b(term, &d.constants, &d, &op, &st, &w, &super::MockVerifier)
+            .expect("generated terms never error")
     }
 
     #[test]
@@ -526,6 +535,9 @@ mod modification {
     use crate::calculus::modify::{admit_modification, candidate, ModificationRejected};
     use crate::calculus::registry::{StatePred, ValueFn};
 
+    // Path `(0, 0)`: `[0]` selects the body slot of the wsh wrapper, `[0]` then selects the
+    // spend-branch body of the match (the user's clause). Paths are descriptor-rooted, so under
+    // wsh the body root is at `[0]` and the first child of the body is at `[0, 0]`.
     const ROTATION: &str = "
         with(
           user = K1,
@@ -538,7 +550,7 @@ mod modification {
                 and(
                   prove(pk_threshold(3, guardians)),
                   blocks_since_activity_at_least(8640),
-                  cmp(=, operation_path(), path(0))
+                  cmp(=, operation_path(), path(0, 0))
                 )
               )
             ),
@@ -553,22 +565,23 @@ mod modification {
     #[test]
     fn guardian_rotation_authorizes_replace_at_the_user_clause() {
         let new_clause = pk("K9"); // the replacement subtree
-        let op = MockOp::replace(vec![0], new_clause);
+        let op = MockOp::replace(vec![0, 0], new_clause);
         let st = MockLedger { since_activity: 9000, ..MockLedger::default() }; // > 8640
-        // 3-of-4 guardians, replacing the subtree at path [0], after inactivity: authorized.
+        // 3-of-4 guardians, replacing the subtree at path [0, 0] (the spend-branch body of the
+        // body's match — i.e. the user's clause), after inactivity: authorized.
         assert!(decide(ROTATION, &op, &st, &["G1", "G2", "G3"]));
     }
 
     #[test]
     fn guardian_rotation_blocked_at_a_different_path() {
-        let op = MockOp::replace(vec![1], pk("K9")); // not the user clause
+        let op = MockOp::replace(vec![0, 1], pk("K9")); // not the user clause (replace-branch body)
         let st = MockLedger { since_activity: 9000, ..MockLedger::default() };
         assert!(!decide(ROTATION, &op, &st, &["G1", "G2", "G3"]));
     }
 
     #[test]
     fn guardian_rotation_blocked_before_inactivity() {
-        let op = MockOp::replace(vec![0], pk("K9"));
+        let op = MockOp::replace(vec![0, 0], pk("K9"));
         let st = MockLedger { since_activity: 10, ..MockLedger::default() };
         assert!(!decide(ROTATION, &op, &st, &["G1", "G2", "G3"]));
     }
@@ -591,10 +604,12 @@ mod modification {
     #[test]
     fn candidate_replaces_the_targeted_subtree() {
         let d = user_can_replace();
-        // Replace the replace-branch body (path [0]) with a new well-formed clause.
-        let op = MockOp::replace(vec![0], pk("K2"));
+        // Replace the replace-branch body (descriptor path [0, 0]: [0]=body, [0]=match arm 0)
+        // with a new well-formed clause.
+        let op = MockOp::replace(vec![0, 0], pk("K2"));
         let cand = candidate(&d, &op).expect("candidate");
-        // The targeted subterm is now pk(K2).
+        // The targeted body-level subterm is now pk(K2). `subterm_at` on the body BTerm is
+        // body-rooted (it operates inside the body), so `&[0]` here is the body's first child.
         assert_eq!(cand.body().unwrap().subterm_at(&[0]), Some(&pk("K2")));
         // The new descriptor is admissible.
         assert!(admit_modification(&d, &op, &CapabilitySet::everything()).is_ok());
@@ -605,7 +620,7 @@ mod modification {
         let d = user_can_replace();
         // Attempt to install `not(prove(pk(K2)))` — a negative-position proof obligation.
         let bad = BTerm::Not(Box::new(pk("K2")));
-        let op = MockOp::replace(vec![0], bad);
+        let op = MockOp::replace(vec![0, 0], bad);
         // The candidate is constructible, but admission rejects it: the modification fails and the
         // deposit keeps its current descriptor.
         match admit_modification(&d, &op, &CapabilitySet::everything()) {
@@ -616,20 +631,21 @@ mod modification {
 
     #[test]
     fn ast_inspection_reads_shape_and_subtree() {
-        // root = and( prove(pk(K1)), cmp(=, ast_shape_at(path(0)), <symbol "pk">) )
-        // child [0] is prove(pk(K1)), whose shape is "pk", so the comparison holds.
+        // body = and( prove(pk(K1)), cmp(=, ast_shape_at(path(0, 0)), <symbol "pk">) )
+        // descriptor path [0, 0] is body's first child = prove(pk(K1)), whose shape is "pk".
         let leaf = pk("K1");
+        let path_0_0 = VTerm::Op(
+            ValueFn::Path,
+            vec![VTerm::Lit(Value::Int(0)), VTerm::Lit(Value::Int(0))],
+        );
         let shape_check = BTerm::Cmp(
             crate::calculus::registry::CmpOp::Eq,
-            VTerm::Op(ValueFn::AstShapeAt, vec![VTerm::Op(ValueFn::Path, vec![VTerm::Lit(Value::Int(0))])]),
+            VTerm::Op(ValueFn::AstShapeAt, vec![path_0_0.clone()]),
             VTerm::Lit(Value::Symbol(crate::calculus::registry::Symbol::new("pk"))),
         );
         let subtree_check = BTerm::State(
             StatePred::SubtreeAt,
-            vec![
-                VTerm::Lit(Value::Subtree(Box::new(leaf.clone()))),
-                VTerm::Op(ValueFn::Path, vec![VTerm::Lit(Value::Int(0))]),
-            ],
+            vec![VTerm::Lit(Value::Subtree(Box::new(leaf.clone()))), path_0_0],
         );
         let body = BTerm::And(vec![leaf, shape_check, subtree_check]);
         let d = Descriptor::wsh(BTreeMap::new(), body);
@@ -1150,9 +1166,10 @@ mod templates {
 
     // ----- social recovery ---------------------------------------------------------------------
     // The owner spends and modifies freely. A 2-of-3 guardian quorum may, after 30 days of
-    // inactivity, replace the owner's spend clause (the subterm at path [0]) — installing a new
-    // key. Authority can expand here (a guardian quorum restores access), which capability
-    // narrowing cannot express.
+    // inactivity, replace the owner's spend clause (descriptor path [0, 0]: [0] selects the body
+    // slot of the implicit wsh wrapper, [0] then selects the spend branch's body in the match) —
+    // installing a new key. Authority can expand here (a guardian quorum restores access), which
+    // capability narrowing cannot express.
     const SOCIAL_RECOVERY: &str = "
         with(owner = K1, guardians = [G1, G2, G3], in match(operation_type(),
           branch(spend, prove(pk(owner))),
@@ -1161,7 +1178,7 @@ mod templates {
             and(
               prove(pk_threshold(2, guardians)),
               blocks_since_activity_at_least(4320),
-              cmp(=, operation_path(), path(0))
+              cmp(=, operation_path(), path(0, 0))
             )
           )),
           branch(else, false)
@@ -1172,7 +1189,7 @@ mod templates {
     #[test]
     fn social_recovery_authorizes_and_applies() {
         let new_owner = clause("prove(pk(K9))");
-        let op = MockOp::replace(vec![0], new_owner.clone());
+        let op = MockOp::replace(vec![0, 0], new_owner.clone());
         let stale = MockLedger { since_activity: 5000, ..MockLedger::default() };
 
         // Quorum is authorized to replace the owner clause after inactivity.
@@ -1184,7 +1201,9 @@ mod templates {
         let fresh = MockLedger { since_activity: 10, ..MockLedger::default() };
         assert!(!decide(SOCIAL_RECOVERY, &op, &fresh, &["G1", "G2"]));
 
-        // The modification produces a well-formed descriptor with the owner clause replaced.
+        // The modification produces a well-formed descriptor with the owner clause replaced. The
+        // BTerm::subterm_at call is body-rooted (it walks the body), so &[0] addresses what
+        // descriptor path [0, 0] addresses from the descriptor root.
         let d = parse::<Pk>(SOCIAL_RECOVERY).unwrap();
         let updated = admit_modification(&d, &op, &CapabilitySet::everything()).expect("admitted");
         assert_eq!(updated.body().unwrap().subterm_at(&[0]), Some(&new_owner));
@@ -1201,7 +1220,7 @@ mod templates {
             branch(spend, and(
               prove(pk(beneficiary)),
               cmp(<=,
-                add(cumulative_spent_via(path(0)), operation_arg(amount)),
+                add(cumulative_spent_via(path(0, 0)), operation_arg(amount)),
                 div(mul(allocation, min(blocks_since_open(), vesting_blocks)), vesting_blocks)
               )
             )),
@@ -2108,9 +2127,14 @@ mod wrappers {
 mod partial_reveal_modification {
     //! Modification under `tr(...)`'s key-path: thornier than the wsh case because the witness
     //! reveals nothing about the body, yet `candidate(...)` still has to compute the post-image
-    //! from the body. The signer "sees" only the internal key; the verifier sees the body. Tests
-    //! here pin down that asymmetry, the scheme-preservation invariants, and the cases that should
-    //! still be rejected even when K signs.
+    //! from the descriptor. The signer "sees" only the internal key; the verifier sees the body.
+    //! Tests here pin down that asymmetry, the scheme-preservation invariants, the descriptor-
+    //! rooted path semantics (including internal-key rotation as `replace` at `[0]`), and the
+    //! cases that should still be rejected even when K signs.
+    //!
+    //! Path conventions, as a refresher: for `wsh(body)` the only addressable slot is `[0]` (the
+    //! body root), so the body's i-th child is `[0, i]`. For `tr(K, body)` the internal key is at
+    //! `[0]` and the body root is at `[1]`, so the body's i-th child is `[1, i]`.
     use super::*;
     use crate::calculus::admission::AdmissionError;
     use crate::calculus::ast::{BTerm, Descriptor, Obligation, Scheme, VTerm};
@@ -2142,18 +2166,19 @@ mod partial_reveal_modification {
     }
 
     // ----------------------------------------------------------------------------------------
-    // Scheme & internal-key invariants
+    // Scheme preservation & body-side modification
     // ----------------------------------------------------------------------------------------
 
     #[test]
     fn modification_preserves_scheme_and_internal_key() {
-        // wsh stays wsh; tr stays tr with the same internal key. AST paths address the body only.
+        // wsh's body root is at `[0]`; tr's at `[1]`. A body-targeted modification keeps the
+        // scheme and (for tr) the internal key.
         let wsh = Descriptor::wsh(BTreeMap::new(), only_k2_can_replace());
         let wsh_cand = candidate(&wsh, &MockOp::replace(vec![0], pk("K9"))).unwrap();
         assert!(matches!(wsh_cand.scheme, Scheme::Wsh { .. }));
 
         let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), only_k2_can_replace());
-        let tr_cand = candidate(&tr, &MockOp::replace(vec![0], pk("K9"))).unwrap();
+        let tr_cand = candidate(&tr, &MockOp::replace(vec![1], pk("K9"))).unwrap();
         match &tr_cand.scheme {
             Scheme::Tr { internal_key, body: Some(_) } => assert_eq!(internal_key, "K1"),
             other => panic!("expected Tr with body, got {:?}", other),
@@ -2161,9 +2186,9 @@ mod partial_reveal_modification {
     }
 
     #[test]
-    fn internal_key_is_unreachable_from_any_modify_path() {
-        // The internal key lives outside the body. Modifications navigate paths into the body;
-        // none of them can touch K. Try paths of varying depth and op types — K is always K1.
+    fn body_paths_never_disturb_the_internal_key() {
+        // Only an explicit `[0]` of a tr descriptor addresses K; everything under `[1, …]` is
+        // body navigation. Try paths of varying depth and op types — K is always K1.
         let original = "K1".to_string();
         let tr = Descriptor::tr(
             BTreeMap::new(),
@@ -2171,11 +2196,11 @@ mod partial_reveal_modification {
             BTerm::And(vec![pk("K2"), BTerm::Or(vec![pk("K3"), pk("K4")])]),
         );
         let ops: Vec<MockOp> = vec![
-            MockOp::replace(vec![], pk("K9")),       // whole body
-            MockOp::replace(vec![0], pk("K9")),      // first child
-            MockOp::replace(vec![1, 0], pk("K9")),   // nested child
-            MockOp::delete(vec![0]),                 // delete first child
-            MockOp::insert(vec![1], pk("K9")),       // insert at the end of And
+            MockOp::replace(vec![1], pk("K9")),       // whole body
+            MockOp::replace(vec![1, 0], pk("K9")),    // first child of body
+            MockOp::replace(vec![1, 1, 0], pk("K9")), // nested
+            MockOp::delete(vec![1, 0]),               // delete first child of body
+            MockOp::insert(vec![1, 1], pk("K9")),     // insert at end of And
         ];
         for op in &ops {
             let cand = candidate(&tr, op).expect("candidate");
@@ -2189,16 +2214,124 @@ mod partial_reveal_modification {
     #[test]
     fn modification_changes_descriptor_id() {
         let d = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
-        let cand = candidate(&d, &MockOp::replace(vec![], pk("K9"))).unwrap();
+        let cand = candidate(&d, &MockOp::replace(vec![1], pk("K9"))).unwrap();
         assert_ne!(descriptor_id(&d), descriptor_id(&cand));
-        // The scheme byte hasn't changed; the body bytes have.
+        // The scheme byte hasn't changed; the bytes after it have.
         let before = encode_descriptor(&d);
         let after = encode_descriptor(&cand);
         assert_eq!(before[0], after[0]); // 0x02 SCHEME_TR
     }
 
     // ----------------------------------------------------------------------------------------
-    // Key-path authorization for modifications
+    // Internal-key rotation: replace at `[0]` of a tr descriptor
+    // ----------------------------------------------------------------------------------------
+
+    #[test]
+    fn replace_at_zero_of_tr_rotates_the_internal_key() {
+        // The defining property of the new path origin: the internal key is *reachable* at `[0]`
+        // of any tr descriptor, and a `replace` operation there is what rotates it.
+        let d = Descriptor::tr(BTreeMap::new(), "K_old".to_string(), pk("K2"));
+        let op = MockOp::rotate_key(vec![0], "K_new");
+        let cand = candidate(&d, &op).expect("candidate");
+        match &cand.scheme {
+            Scheme::Tr { internal_key, body: Some(b) } => {
+                assert_eq!(internal_key, "K_new");
+                // The body is unchanged — only the key moved.
+                assert_eq!(b, &pk("K2"));
+            }
+            other => panic!("expected Tr with body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rotation_against_tr_without_body_is_supported() {
+        // `tr(K)` has no body, but its internal key is still at `[0]` and rotatable. After
+        // rotation the descriptor is still `tr(K_new)` with no body.
+        let d = Descriptor::tr_key_only(BTreeMap::new(), "K_old".to_string());
+        let cand = candidate(&d, &MockOp::rotate_key(vec![0], "K_new")).expect("candidate");
+        assert!(matches!(&cand.scheme, Scheme::Tr { body: None, .. }));
+        match &cand.scheme {
+            Scheme::Tr { internal_key, .. } => assert_eq!(internal_key, "K_new"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn rotation_at_zero_of_wsh_is_rejected() {
+        // wsh has no internal key; `[0]` addresses the body root, not a key, so a `replace` op
+        // that supplies `key` instead of `subtree` fails to build a body — the body op requires
+        // `subtree`.
+        let d = Descriptor::wsh(BTreeMap::new(), pk("K2"));
+        let op = MockOp::rotate_key(vec![0], "K_new");
+        assert_eq!(candidate(&d, &op), Err(ModifyError::MissingArg("subtree")));
+    }
+
+    #[test]
+    fn rotation_requires_a_key_argument_not_a_subtree() {
+        // At `[0]` of a tr descriptor the modifier expects a `key` argument. A plain
+        // `MockOp::replace` carries `subtree`, so it's rejected with a clear missing-arg error.
+        let d = Descriptor::tr(BTreeMap::new(), "K_old".to_string(), pk("K2"));
+        let op = MockOp::replace(vec![0], pk("K_new")); // wrong shape — `subtree`, not `key`
+        assert_eq!(candidate(&d, &op), Err(ModifyError::MissingArg("key")));
+    }
+
+    #[test]
+    fn insert_and_delete_at_zero_of_tr_are_rejected() {
+        // The descriptor's shape is fixed by its scheme: you can't add siblings to K (there's no
+        // such position) and can't delete K (the result wouldn't be a tr descriptor).
+        let d = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
+        let mut ins_args = BTreeMap::new();
+        ins_args.insert("path".to_string(), Value::Path(vec![0]));
+        ins_args.insert("key".to_string(), Value::Key("K_new".to_string()));
+        let bad_insert = MockOp { ty: "insert", args: ins_args, nonce: 0 };
+        let mut del_args = BTreeMap::new();
+        del_args.insert("path".to_string(), Value::Path(vec![0]));
+        let bad_delete = MockOp { ty: "delete", args: del_args, nonce: 0 };
+        assert!(matches!(
+            candidate(&d, &bad_insert),
+            Err(ModifyError::NotAModification(_)),
+        ));
+        assert!(matches!(
+            candidate(&d, &bad_delete),
+            Err(ModifyError::NotAModification(_)),
+        ));
+    }
+
+    #[test]
+    fn rotation_path_deeper_than_zero_is_rejected() {
+        // Only the exact path `[0]` rotates K. `[0, 0]`, `[0, 5]`, etc. don't address anything
+        // (K is a leaf in the descriptor's path tree).
+        let d = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
+        assert_eq!(
+            candidate(&d, &MockOp::rotate_key(vec![0, 0], "K_new")),
+            Err(ModifyError::PathOutOfRange),
+        );
+        assert_eq!(
+            candidate(&d, &MockOp::rotate_key(vec![0, 5], "K_new")),
+            Err(ModifyError::PathOutOfRange),
+        );
+    }
+
+    #[test]
+    fn rotation_authorized_by_the_existing_internal_key() {
+        // A typical end-to-end key-rotation flow: K_old signs the rotation op via the key-path,
+        // and the resulting descriptor binds to K_new. The next operation will need K_new.
+        let d = Descriptor::tr(BTreeMap::new(), "K_old".to_string(), pk("K_body"));
+        let rotate = MockOp::rotate_key(vec![0], "K_new");
+
+        // K_old's signature on the rotate op authorizes via the key-path.
+        assert!(decide_d(&d, &rotate, &["K_old"]));
+        // The candidate descriptor has K_new and is admissible.
+        let admitted =
+            admit_modification(&d, &rotate, &CapabilitySet::everything()).expect("admitted");
+        match &admitted.scheme {
+            Scheme::Tr { internal_key, .. } => assert_eq!(internal_key, "K_new"),
+            _ => panic!("expected Tr"),
+        }
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Key-path authorization for body-targeted modifications
     // ----------------------------------------------------------------------------------------
 
     #[test]
@@ -2214,26 +2347,31 @@ mod partial_reveal_modification {
         let body = only_k2_can_replace();
         let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), body.clone());
         let wsh = Descriptor::wsh(BTreeMap::new(), body);
-        let op = MockOp::replace(vec![0], pk("K9"));
+
+        // tr path: `[1, …]` addresses the body. wsh path: `[0, …]` does. Both target arms[0].body
+        // of the match, which is what `only_k2_can_replace` puts at body's first child.
+        let tr_op = MockOp::replace(vec![1, 0], pk("K9"));
+        let wsh_op = MockOp::replace(vec![0, 0], pk("K9"));
 
         // Under tr: K1's signature alone authorizes via the key-path.
-        assert!(decide_d(&tr, &op, &["K1"]));
+        assert!(decide_d(&tr, &tr_op, &["K1"]));
         // Under wsh: K1 is just an unrelated key — the body doesn't mention it, so nothing in the
         // body authorizes, and there's no key-path to fall back on.
-        assert!(!decide_d(&wsh, &op, &["K1"]));
+        assert!(!decide_d(&wsh, &wsh_op, &["K1"]));
 
         // And under tr the full modify flow goes through without the body ever firing.
         let admitted =
-            admit_modification(&tr, &op, &CapabilitySet::everything()).expect("admitted");
+            admit_modification(&tr, &tr_op, &CapabilitySet::everything()).expect("admitted");
+        // The body's first child (the match's arms[0].body) is now pk(K9).
         assert_eq!(admitted.body().unwrap().subterm_at(&[0]), Some(&pk("K9")));
     }
 
     #[test]
     fn key_path_can_replace_the_root_body_wholesale() {
-        // `replace_at(body, [], new)` rewrites the entire body. With tr's key-path, K alone is
-        // sufficient to swap the policy out for an unrelated one.
+        // `replace` at `[1]` of a tr descriptor rewrites the entire body. With tr's key-path, K
+        // alone is sufficient to swap the policy out for an unrelated one.
         let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), only_k2_can_replace());
-        let op = MockOp::replace(vec![], pk("K9"));
+        let op = MockOp::replace(vec![1], pk("K9"));
         assert!(decide_d(&tr, &op, &["K1"]));
         let new_d =
             admit_modification(&tr, &op, &CapabilitySet::everything()).expect("admitted");
@@ -2257,7 +2395,7 @@ mod partial_reveal_modification {
             BTerm::And(vec![pk("K_b"), pk("K_c"), pk("K_d")]),
         ]);
         let tr = Descriptor::tr(BTreeMap::new(), "K_super".to_string(), body);
-        let op = MockOp::replace(vec![], pk("K9"));
+        let op = MockOp::replace(vec![1], pk("K9"));
 
         let minimal_witness = witness_signed_by(&op, &["K_super"]);
         // The witness has exactly one signature entry — for the internal key only.
@@ -2274,12 +2412,13 @@ mod partial_reveal_modification {
 
     #[test]
     fn key_path_does_not_excuse_an_inadmissible_candidate() {
-        // K1 signs, so the *operation* would be authorized — but `replace_at` produces a body that
-        // violates polarity (`not(prove(...))`). Admission still runs on the candidate and
-        // rejects: a key-path-authorized modification cannot install an ill-formed policy.
+        // K1 signs, so the *operation* would be authorized — but `replace` at the body root
+        // produces a body that violates polarity (`not(prove(...))`). Admission still runs on the
+        // candidate and rejects: a key-path-authorized modification cannot install an ill-formed
+        // policy.
         let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
         let bad = BTerm::Not(Box::new(pk("K9")));
-        let op = MockOp::replace(vec![], bad);
+        let op = MockOp::replace(vec![1], bad);
 
         // Key-path authorizes the *operation*…
         assert!(decide_d(&tr, &op, &["K1"]));
@@ -2292,8 +2431,8 @@ mod partial_reveal_modification {
 
     #[test]
     fn key_path_does_not_excuse_a_malformed_path() {
-        // Path indexes a position that doesn't exist. `candidate` fails to build the post-image,
-        // regardless of who signed.
+        // Path leading index doesn't address any scheme slot. `candidate` fails to build the
+        // post-image, regardless of who signed.
         let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
         let op = MockOp::replace(vec![5], pk("K9"));
         assert_eq!(candidate(&tr, &op), Err(ModifyError::PathOutOfRange));
@@ -2304,12 +2443,11 @@ mod partial_reveal_modification {
     }
 
     #[test]
-    fn tr_without_body_cannot_be_modified_even_with_internal_key() {
-        // `tr(K)` has no body to navigate into. `candidate` returns MissingArg("body") because
-        // there is nothing for the path to address. Key-path can authorize *operations* of any
-        // type, but modifications need a body to operate on.
+    fn tr_without_body_rejects_body_targeted_paths() {
+        // `tr(K)` has no body, so `[1, …]` doesn't address anything. The error names which arg
+        // was missing: the body itself.
         let tr = Descriptor::tr_key_only(BTreeMap::new(), "K1".to_string());
-        let op = MockOp::replace(vec![], pk("K9"));
+        let op = MockOp::replace(vec![1], pk("K9"));
         assert_eq!(candidate(&tr, &op), Err(ModifyError::MissingArg("body")));
     }
 
@@ -2320,20 +2458,20 @@ mod partial_reveal_modification {
     #[test]
     fn candidate_depends_on_current_body_not_on_witness() {
         // The candidate is a pure function of the current descriptor and the operation. The same
-        // K1 signature can authorize a `replace [] subtree=pk(K9)` op against two different
-        // descriptors with the same internal key, but each produces its own candidate body.
+        // K1 signature can authorize a "replace the body" op against two different descriptors
+        // with the same internal key, but each produces its own candidate body.
         let b1 = pk("K_a");
         let b2 = BTerm::And(vec![pk("K_b"), pk("K_c")]);
         let d1 = Descriptor::tr(BTreeMap::new(), "K1".to_string(), b1);
         let d2 = Descriptor::tr(BTreeMap::new(), "K1".to_string(), b2);
-        let op = MockOp::replace(vec![], pk("K9"));
+        let op = MockOp::replace(vec![1], pk("K9"));
 
         let c1 = candidate(&d1, &op).unwrap();
         let c2 = candidate(&d2, &op).unwrap();
-        // Same op, same result body (because path is [] and subtree is fixed).
+        // Same op, same result body (path is `[1]`, subtree is fixed).
         assert_eq!(c1.body(), c2.body());
-        // But the starting descriptor ids are different — modify is *navigated* against the body
-        // we already have, even when the new body doesn't depend on the old one.
+        // But the starting descriptor ids are different — modify is *navigated* against the
+        // current body we already have, even when the new body doesn't depend on the old one.
         assert_ne!(descriptor_id(&d1), descriptor_id(&d2));
     }
 
@@ -2342,8 +2480,8 @@ mod partial_reveal_modification {
         // K1 signs a *specific* (path, subtree) pair. Reusing the signature against a different
         // subtree under the same op type produces a different preimage, so verification fails.
         let tr = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
-        let real_op = MockOp::replace(vec![], pk("K9"));
-        let forged_op = MockOp::replace(vec![], pk("K_evil"));
+        let real_op = MockOp::replace(vec![1], pk("K9"));
+        let forged_op = MockOp::replace(vec![1], pk("K_evil"));
 
         let w = witness_signed_by(&real_op, &["K1"]);
         // Authorizes the op it signed.
@@ -2358,10 +2496,10 @@ mod partial_reveal_modification {
         // T --K1.modify--> T' --K1.modify--> T''. Each step's candidate becomes the next step's
         // current. Scheme & internal key are preserved end-to-end; the body evolves.
         let t0 = Descriptor::tr(BTreeMap::new(), "K1".to_string(), pk("K2"));
-        let step1 = MockOp::replace(vec![], BTerm::Or(vec![pk("K_a"), pk("K_b")]));
+        let step1 = MockOp::replace(vec![1], BTerm::Or(vec![pk("K_a"), pk("K_b")]));
         let t1 = admit_modification(&t0, &step1, &CapabilitySet::everything())
             .expect("first step admitted");
-        let step2 = MockOp::replace(vec![1], pk("K_c"));
+        let step2 = MockOp::replace(vec![1, 1], pk("K_c"));
         let t2 = admit_modification(&t1, &step2, &CapabilitySet::everything())
             .expect("second step admitted");
 
@@ -2375,7 +2513,7 @@ mod partial_reveal_modification {
         // Each id is fresh.
         assert_ne!(descriptor_id(&t0), descriptor_id(&t1));
         assert_ne!(descriptor_id(&t1), descriptor_id(&t2));
-        // Body content reflects step2.
+        // Body content reflects step2 (body's child at index 1 is now pk(K_c)).
         assert_eq!(t2.body().unwrap().subterm_at(&[1]), Some(&pk("K_c")));
     }
 }

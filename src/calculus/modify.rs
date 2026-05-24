@@ -192,36 +192,96 @@ fn insert_child<Pk: MiniscriptKey>(
 }
 
 /// Compute the candidate descriptor an `insert`/`replace`/`delete` operation would produce.
+///
+/// Paths are *descriptor-rooted* (see [`Descriptor::node_at`](super::ast::Descriptor::node_at)):
+/// the leading index selects which structural slot the operation addresses, and the rest navigates
+/// inside it. For `wsh(body)` the only slot is `[0]` (the body root); for `tr(K, body)`, `[0]`
+/// addresses the internal key and `[1, …]` addresses positions in the body. Internal-key rotation
+/// is `replace` at `[0]` of a `tr` descriptor, with the new key supplied as the `key` argument.
 pub fn candidate<Pk, O>(current: &Descriptor<Pk>, op: &O) -> Result<Descriptor<Pk>, ModifyError>
 where
     Pk: MiniscriptKey,
     O: Operation<Pk>,
 {
     let path = op.path().ok_or(ModifyError::MissingArg("path"))?;
-    let current_body =
-        current.body().ok_or(ModifyError::MissingArg("body"))?; // tr(K) has no body to modify
-    let new_body = match op.op_type().as_str() {
+    let op_type = op.op_type();
+    let (head, rest) = path.split_first().ok_or(ModifyError::EmptyPath)?;
+    match &current.scheme {
+        Scheme::Wsh { body } => {
+            // wsh's only structural slot is the body, at `[0]`.
+            if *head != 0 {
+                return Err(ModifyError::PathOutOfRange);
+            }
+            let new_body = apply_body_op(body, op_type.as_str(), rest, op)?;
+            Ok(Descriptor {
+                constants: current.constants.clone(),
+                scheme: Scheme::Wsh { body: new_body },
+            })
+        }
+        Scheme::Tr { internal_key, body } => match *head {
+            0 => {
+                // Path addresses the internal key. The descriptor's shape is fixed by the scheme,
+                // so insert and delete aren't meaningful here (no siblings of K, no descriptor
+                // without K); only `replace` rotates the key.
+                if !rest.is_empty() {
+                    return Err(ModifyError::PathOutOfRange);
+                }
+                if op_type.as_str() != "replace" {
+                    return Err(ModifyError::NotAModification(format!(
+                        "internal-key rotation requires `replace`, got `{}`",
+                        op_type.as_str()
+                    )));
+                }
+                let new_key = match op.arg("key") {
+                    Some(super::value::Value::Key(k)) => k,
+                    _ => return Err(ModifyError::MissingArg("key")),
+                };
+                Ok(Descriptor {
+                    constants: current.constants.clone(),
+                    scheme: Scheme::Tr { internal_key: new_key, body: body.clone() },
+                })
+            }
+            1 => {
+                // Path addresses the body. `tr(K)` (no body) cannot satisfy this — there is
+                // nothing at `[1, …]` to address.
+                let body = body.as_ref().ok_or(ModifyError::MissingArg("body"))?;
+                let new_body = apply_body_op(body, op_type.as_str(), rest, op)?;
+                Ok(Descriptor {
+                    constants: current.constants.clone(),
+                    scheme: Scheme::Tr {
+                        internal_key: internal_key.clone(),
+                        body: Some(new_body),
+                    },
+                })
+            }
+            _ => Err(ModifyError::PathOutOfRange),
+        },
+    }
+}
+
+/// Apply a body-level `insert`/`replace`/`delete` at the body-rooted sub-path.
+fn apply_body_op<Pk, O>(
+    body: &BTerm<Pk>,
+    op_type: &str,
+    body_path: &[usize],
+    op: &O,
+) -> Result<BTerm<Pk>, ModifyError>
+where
+    Pk: MiniscriptKey,
+    O: Operation<Pk>,
+{
+    match op_type {
         "replace" => {
             let sub = op.subtree().ok_or(ModifyError::MissingArg("subtree"))?;
-            replace_at(current_body, &path, sub)?
+            replace_at(body, body_path, sub)
         }
         "insert" => {
             let sub = op.subtree().ok_or(ModifyError::MissingArg("subtree"))?;
-            insert_at(current_body, &path, sub)?
+            insert_at(body, body_path, sub)
         }
-        "delete" => delete_at(current_body, &path)?,
-        other => return Err(ModifyError::NotAModification(other.to_string())),
-    };
-    // Preserve the scheme; only the body changes. The internal key of a `tr(...)` is structural
-    // and is not modifiable through ast operations.
-    let scheme = match &current.scheme {
-        Scheme::Wsh { .. } => Scheme::Wsh { body: new_body },
-        Scheme::Tr { internal_key, .. } => Scheme::Tr {
-            internal_key: internal_key.clone(),
-            body: Some(new_body),
-        },
-    };
-    Ok(Descriptor { constants: current.constants.clone(), scheme })
+        "delete" => delete_at(body, body_path),
+        other => Err(ModifyError::NotAModification(other.to_string())),
+    }
 }
 
 /// Compute the candidate descriptor and re-run admission on it. Returns the new descriptor only if

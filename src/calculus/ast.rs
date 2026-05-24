@@ -222,4 +222,33 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
     pub fn tr_key_only(constants: BTreeMap<String, Value<Pk>>, internal_key: Pk) -> Self {
         Descriptor { constants, scheme: Scheme::Tr { internal_key, body: None } }
     }
+
+    /// Navigate a *descriptor-rooted* ast path. The path starts at the descriptor itself, with
+    /// scheme-specific children: `wsh(body)` exposes the body root at `[0]`; `tr(K)` exposes the
+    /// internal key at `[0]`; `tr(K, body)` exposes the internal key at `[0]` and the body root
+    /// at `[1]`. Deeper positions in the body extend the path the same way [`BTerm::subterm_at`]
+    /// does, so e.g. `[1, 2]` in a `tr(K, body)` addresses the body's child at index 2.
+    pub fn node_at(&self, path: &[usize]) -> Option<DescriptorNode<'_, Pk>> {
+        let (head, rest) = path.split_first()?;
+        match &self.scheme {
+            Scheme::Wsh { body } => match *head {
+                0 => body.subterm_at(rest).map(DescriptorNode::Body),
+                _ => None,
+            },
+            Scheme::Tr { internal_key, body } => match (*head, rest) {
+                (0, []) => Some(DescriptorNode::InternalKey(internal_key)),
+                (1, sub) => body.as_ref().and_then(|b| b.subterm_at(sub)).map(DescriptorNode::Body),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A reference to a node addressed by a descriptor-rooted ast path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DescriptorNode<'a, Pk: MiniscriptKey> {
+    /// A B-term subtree of the body.
+    Body(&'a BTerm<Pk>),
+    /// The internal key of a `tr` descriptor.
+    InternalKey(&'a Pk),
 }
